@@ -530,6 +530,13 @@ export function BaseList<ItemT>(
 
 Add `src/components/list/index.ts` barrel.
 
+**FlashList usage rules** (callers of `BaseList` must follow):
+- `estimatedItemSize` is **required** — measure a real item's rendered height and pass it. Wrong values cause scroll jank and white flashes.
+- `keyExtractor` must return a stable, unique string for each item. **Never use the array index** — it breaks recycling when the list reorders.
+- Wrap the `renderItem` component in `React.memo` so FlashList can skip re-renders for unchanged items.
+- Pass `useCallback`-stabilised functions as props to list items, never inline arrow functions.
+- Use `FlashList` for every scrollable list. Fall back to `FlatList` or `SectionList` only when FlashList genuinely cannot support the required structure (rare).
+
 ### 6.4 ScreenWrapper — `src/components/wrappers/ScreenWrapper.tsx`
 
 ```typescript
@@ -640,6 +647,8 @@ export const AppWrapper = ({ children }: PropsWithChildren) => (
 
 Update `App.tsx` to wrap the root navigator with `AppWrapper`.
 
+> **If `rn-setup` chose Apollo Client (GraphQL):** wrap `ApolloProvider` OUTSIDE `AppWrapper` in `App.tsx` — Apollo should be the outermost provider so any descendant (including `AppWrapper`'s children) can use Apollo hooks. `AppWrapper` itself wraps React Query unconditionally; if you don't use React Query, you can safely strip `QueryClientProvider` from `AppWrapper`. If `rn-setup` chose REST + React Query, `AppWrapper`'s `QueryClientProvider` is already correct as-is.
+
 ---
 
 ## Step 8 — Example Home Screen
@@ -710,6 +719,7 @@ Verify the app builds and runs without errors. If a font was configured in Step 
 - All imports MUST use `@/` aliases
 - Every folder MUST have barrel `index.ts`
 - Styles via `useThemeStyles` hook — never `StyleSheet.create` in components
+- No anonymous functions in JSX props (use `useCallback` + named handlers) — critical for FlashList item performance
 - If the user replied `skip` to the font question, do NOT add any font package or `.ttf` reference
 - If the project already has any of these files, skip — do not overwrite
 - Run `yarn lint --fix` after all files are created

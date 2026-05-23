@@ -80,6 +80,7 @@ src/
   utils/
   constants/
   theme/
+  types/
   assets/
     images/
     fonts/
@@ -131,6 +132,13 @@ Install dev deps: `eslint-plugin-import`, `eslint-import-resolver-typescript`, `
 ```json
 "test:coverage": "jest --coverage"
 ```
+
+**Testing rules** (enforce in code review):
+- Every custom hook in `src/hooks/` must have a unit test.
+- Every utility function in `src/utils/` must have a unit test.
+- Screen components: snapshot test as the minimum; add interaction tests for forms.
+- Mock at the boundary (Apollo, native modules, network) — never mock internal modules.
+- Tests live in `__tests__/` mirroring the `src/` structure.
 
 ### 2.5 Dev Environment Consistency
 
@@ -221,7 +229,10 @@ Create `src/store/storage.ts`:
 import { MMKV } from 'react-native-mmkv';
 import type { StateStorage } from 'zustand/middleware';
 
-export const mmkv = new MMKV({ id: 'app-storage' });
+export const mmkv = new MMKV({
+  id: 'app-storage',
+  encryptionKey: 'app-storage-key', // override per-project; for sensitive prod use, fetch from Keychain/Keystore at boot
+});
 
 export const zustandMMKVStorage: StateStorage = {
   getItem: (name) => mmkv.getString(name) ?? null,
@@ -351,6 +362,7 @@ Update CLAUDE.md to reflect:
 - All imports must use `@/` path aliases
 - Every `src/` folder must have a barrel `index.ts`
 - Screens = UI only; business logic in hooks/services
+- No anonymous functions in JSX props (e.g. `onPress={handlePress}`, not `onPress={() => doSomething()}`) — they break referential equality and cause unnecessary re-renders, especially in lists
 - Run lint fix at the end to enforce import ordering
 - Remove unused packages and dead code
 - Keep CLAUDE.md in sync with all changes
