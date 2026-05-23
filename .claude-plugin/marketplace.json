@@ -1,0 +1,15 @@
+{
+  "name": "rn-scaffold-marketplace",
+  "owner": {
+    "name": "Shruti Jasoliya",
+    "url": "https://github.com/JasoliyaShruti"
+  },
+  "plugins": [
+    {
+      "name": "rn-scaffold",
+      "source": "./",
+      "description": "Production-ready React Native CLI scaffold + core deps",
+      "version": "0.1.0"
+    }
+  ]
+}
