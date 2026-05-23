@@ -39,10 +39,10 @@ Install all packages using the project's package manager (check `package.json` f
 ### Animation & Gesture
 
 ```bash
-yarn add react-native-reanimated react-native-gesture-handler
+yarn add react-native-reanimated react-native-worklets react-native-gesture-handler
 ```
 
-> `react-native-worklets` is bundled inside reanimated v4+ as a transitive dep — no separate install needed.
+> `react-native-worklets` MUST be installed as a direct dependency. Reanimated v4 extracted worklets into this separate package and it is a peer dep — Yarn Classic does not auto-install peer deps, and even on package managers that do, relying on auto-resolution is fragile (monorepo hoisting, etc.). The babel plugin imports from `react-native-worklets/plugin`, so the package has to be resolvable from `node_modules`.
 
 **Babel config** — add to `babel.config.js` plugins (worklets plugin MUST be last):
 
