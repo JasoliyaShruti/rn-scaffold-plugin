@@ -9,7 +9,7 @@
       "name": "rn-scaffold",
       "source": "./",
       "description": "Production-ready React Native CLI scaffold + core deps",
-      "version": "0.1.2"
+      "version": "0.1.3"
     }
   ]
 }

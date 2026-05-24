@@ -36,6 +36,8 @@ Wait for both answers before proceeding.
 
 Install all packages using the project's package manager (check `package.json` for yarn/npm/bun).
 
+> **Conditional install — React Query:** `@tanstack/react-query` is required only when `rn-setup` selected REST + React Query (Q3 = 1). For Apollo (GraphQL) or `None`, skip it — see Step 7. The unconditional-install pattern from earlier versions of this skill shipped an unused package on Apollo projects.
+
 ### Animation & Gesture
 
 ```bash
@@ -97,9 +99,38 @@ const STATIC_COLORS = {
   // If brand colors provided, add them here, e.g.:
   // brandPrimary: '#FF6B00',
   // brandSecondary: '#1B1B1B',
-} as const;
+};
 
-export const LightThemeColors = {
+export type ThemeColorsType = {
+  tint: string;
+  primary: string;
+  secondary: string;
+
+  text: string;
+  textSecondary: string;
+  textDisabled: string;
+  textInverse: string;
+
+  background: string;
+  backgroundSecondary: string;
+  backgroundInverse: string;
+
+  border: string;
+  borderFocus: string;
+
+  success: string;
+  error: string;
+  warning: string;
+  info: string;
+
+  overlay: string;
+  transparent: string;
+
+  skeletonShimmerStart: string;
+  skeletonShimmerEnd: string;
+};
+
+export const LightThemeColors: ThemeColorsType = {
   tint: '#111111',           // → STATIC_COLORS.brandPrimary if brand colors provided
   primary: STATIC_COLORS.black,    // → STATIC_COLORS.brandPrimary
   secondary: STATIC_COLORS.white,  // → STATIC_COLORS.brandSecondary
@@ -127,21 +158,23 @@ export const LightThemeColors = {
   skeletonShimmerStart: '#EEEEEE',
   skeletonShimmerEnd: '#D2D2D2',
 };
-
-export type ThemeColorsType = typeof LightThemeColors;
 ```
 
-Create `src/theme/resources/DarkThemeResources.ts` — same shape, concrete dark values:
+> **Why `ThemeColorsType` is an explicit interface, not `typeof LightThemeColors`:** with `typeof` + `as const` (or even without), TypeScript infers literal types for every value (`primary: '#111111'`). The Dark theme then has *different* literal types for the same keys (`primary: '#FFFFFF'`), so `LightThemeColors | DarkThemeColors` collapses to an unhelpful union that doesn't satisfy a single `ThemeColorsType`. Result: `useThemeStyles` typechecks fail because `ThemeResources[theme]` doesn't widen to a single colors shape. The explicit-interface form keeps both palettes typed as `string` for each slot, and the union is structurally identical.
+
+Create `src/theme/resources/DarkThemeResources.ts` — same shape, concrete dark values, explicitly typed:
 
 ```typescript
+import type { ThemeColorsType } from './LightThemeResources';
+
 const STATIC_COLORS_DARK = {
   black: '#111111',
   white: '#FFFFFF',
   transparent: 'transparent',
   // Same brand colors as light if provided
-} as const;
+};
 
-export const DarkThemeColors = {
+export const DarkThemeColors: ThemeColorsType = {
   tint: '#FFFFFF',
   primary: STATIC_COLORS_DARK.white,
   secondary: STATIC_COLORS_DARK.black,
@@ -174,16 +207,18 @@ export const DarkThemeColors = {
 Create `src/theme/resources/index.ts`:
 
 ```typescript
-import { LightThemeColors } from './LightThemeResources';
 import { DarkThemeColors } from './DarkThemeResources';
+import { LightThemeColors, ThemeColorsType } from './LightThemeResources';
 
-export const ThemeResources = {
+export const ThemeResources: Record<'light' | 'dark', ThemeColorsType> = {
   light: LightThemeColors,
   dark: DarkThemeColors,
-} as const;
+};
 
 export type { ThemeColorsType } from './LightThemeResources';
 ```
+
+> **No `as const` on `ThemeResources`:** the `Record<...>` annotation gives us the right type. `as const` would re-narrow back to literal-typed entries, defeating the purpose of the interface.
 
 ### 2.2 Typography — `src/theme/typography.ts`
 
@@ -321,10 +356,13 @@ export type { NamedStyles } from './styleTypes';
 
 ## Step 4 — Zustand Theme Store (with OS dark mode integration)
 
-### `src/zustand/ThemeState.ts`
+### `src/store/themeStore.ts`
+
+> **Why `src/store/` and not `src/zustand/`:** `rn-setup` already created `src/store/` for Zustand stores (`authStore.ts`, `storage.ts`). Adding a separate `src/zustand/` folder would split state across two parallel locations. Naming this file `themeStore.ts` mirrors `authStore.ts`; the exported hook is `useThemeState` to match `useAuthStore`.
 
 ```typescript
 import { Appearance } from 'react-native';
+
 import { create } from 'zustand';
 
 export type ThemeMode = 'light' | 'dark' | 'system';
@@ -335,27 +373,34 @@ export type ThemeStateType = {
   setMode: (mode: ThemeMode) => void;
 };
 
+// Appearance.getColorScheme() returns `'light' | 'dark' | null | undefined` in
+// current RN typings — never trust it to be one of just the two strings.
+const normalize = (scheme: string | null | undefined): 'light' | 'dark' =>
+  scheme === 'dark' ? 'dark' : 'light';
+
 const resolve = (mode: ThemeMode): 'light' | 'dark' => {
-  if (mode === 'system') return Appearance.getColorScheme() ?? 'light';
+  if (mode === 'system') {
+    return normalize(Appearance.getColorScheme());
+  }
   return mode;
 };
 
-export const ThemeState = create<ThemeStateType>((set) => ({
+export const useThemeState = create<ThemeStateType>(set => ({
   mode: 'system',
   theme: resolve('system'),
-  setMode: (mode) => set({ mode, theme: resolve(mode) }),
+  setMode: mode => set({ mode, theme: resolve(mode) }),
 }));
 
 // Re-resolve when OS theme changes (only if user is in 'system' mode)
 Appearance.addChangeListener(({ colorScheme }) => {
-  const { mode } = ThemeState.getState();
+  const { mode } = useThemeState.getState();
   if (mode === 'system') {
-    ThemeState.setState({ theme: colorScheme ?? 'light' });
+    useThemeState.setState({ theme: normalize(colorScheme) });
   }
 });
 ```
 
-Update `src/zustand/index.ts` barrel.
+Update `src/store/index.ts` barrel to export `themeStore` alongside `authStore` and `storage`.
 
 > Default is `'system'` so the app respects OS dark mode automatically. Users can override via `setMode('light')` / `setMode('dark')`.
 
@@ -368,9 +413,9 @@ Update `src/zustand/index.ts` barrel.
 ```typescript
 import { useMemo } from 'react';
 
+import { useThemeState, ThemeStateType } from '@/store';
 import { ThemeColorsType, ThemeResources } from '@/theme';
 import { NamedStyles } from '@/types';
-import { ThemeState, ThemeStateType } from '@/zustand';
 
 export type UseThemePropsType = ThemeStateType & { colors: ThemeColorsType };
 
@@ -378,20 +423,23 @@ export const useThemeStyles = <T extends NamedStyles<T>>(
   func: (args: UseThemePropsType) => T,
   dependencies: ReadonlyArray<unknown> = [],
 ): T => {
-  const props = ThemeState();
+  const props = useThemeState();
   const colors = ThemeResources[props.theme];
   return useMemo(
     () => func({ ...props, colors }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [props, colors, ...dependencies],
   );
 };
 
 export const useThemeValues = (): UseThemePropsType => {
-  const props = ThemeState();
+  const props = useThemeState();
   const colors = ThemeResources[props.theme];
   return useMemo(() => ({ ...props, colors }), [props, colors]);
 };
 ```
+
+> The `eslint-disable-next-line react-hooks/exhaustive-deps` is intentional: the `dependencies` array is spread in, and exhaustive-deps can't see through the spread. The standard React docs sanction this exact pattern.
 
 No `as any`. Caller's style object infers cleanly:
 
@@ -413,6 +461,7 @@ Update `src/hooks/index.ts` barrel.
 ```typescript
 import { memo, useEffect, useMemo } from 'react';
 import { StyleProp, StyleSheet, ViewStyle } from 'react-native';
+
 import Animated, {
   cancelAnimation,
   interpolateColor,
@@ -421,6 +470,7 @@ import Animated, {
   withRepeat,
   withTiming,
 } from 'react-native-reanimated';
+
 import { useThemeValues } from '@/hooks';
 
 type BaseSkeletonProps = {
@@ -429,7 +479,11 @@ type BaseSkeletonProps = {
   isLoading?: boolean;
 };
 
-export const BaseSkeleton = ({ style, duration = 500, isLoading = true }: BaseSkeletonProps) => {
+export const BaseSkeleton = ({
+  style,
+  duration = 500,
+  isLoading = true,
+}: BaseSkeletonProps) => {
   const progress = useSharedValue(0);
   const { colors } = useThemeValues();
 
@@ -443,20 +497,38 @@ export const BaseSkeleton = ({ style, duration = 500, isLoading = true }: BaseSk
       progress.value = withRepeat(withTiming(1, { duration }), -1, true);
     }
     return () => cancelAnimation(progress);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [duration, isLoading]);
 
   const animatedStyle = useAnimatedStyle(
-    () => ({ backgroundColor: interpolateColor(progress.value, [0, 1], shimmerColors) }),
+    () => ({
+      backgroundColor: interpolateColor(progress.value, [0, 1], shimmerColors),
+    }),
     [shimmerColors],
   );
 
   return isLoading ? (
-    <Animated.View style={[{ ...StyleSheet.absoluteFillObject, zIndex: 1000 }, style, animatedStyle]} />
+    <Animated.View style={[skeletonStyles.fill, style, animatedStyle]} />
   ) : null;
 };
 
+const skeletonStyles = StyleSheet.create({
+  fill: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 1000,
+  },
+});
+
 export const MemoizedBaseSkeleton = memo(BaseSkeleton);
 ```
+
+> **Why explicit position styles, not `StyleSheet.absoluteFillObject`:** in React Native 0.80+ the StyleSheet typings only expose `StyleSheet.absoluteFill` (a readonly object), not the older `absoluteFillObject`. Spreading `absoluteFill` works at runtime but TypeScript rejects it. Inlining the four `position`/edges in a named StyleSheet entry is the most portable form.
+>
+> The `eslint-disable-next-line` on the cleanup effect is intentional — the cleanup uses `progress` (a stable Reanimated shared value reference), which exhaustive-deps over-reports.
 
 Add `src/components/skeleton/index.ts` barrel.
 
@@ -464,49 +536,77 @@ Add `src/components/skeleton/index.ts` barrel.
 
 ```typescript
 import { useCallback, useMemo, useState } from 'react';
-import { StyleProp, View, ViewStyle } from 'react-native';
-import DefaultFastImage, { FastImageProps as DefaultFastImageProps } from '@d11/react-native-fast-image';
+import { StyleProp, StyleSheet, View, ViewStyle } from 'react-native';
+
+import DefaultFastImage, {
+  FastImageProps as DefaultFastImageProps,
+} from '@d11/react-native-fast-image';
+
 import { MemoizedBaseSkeleton } from '@/components/skeleton';
 
 export type FastImageProps = DefaultFastImageProps & {
   containerStyle?: StyleProp<ViewStyle>;
 };
 
-export const FastImage = ({ containerStyle, ...imageProps }: FastImageProps) => {
+export const FastImage = ({
+  containerStyle,
+  ...imageProps
+}: FastImageProps) => {
   const [isLoading, setIsLoading] = useState(true);
   const [isError, setIsError] = useState(false);
 
-  const showPlaceholder = useMemo(() => !imageProps.source || isError, [imageProps.source, isError]);
+  const showPlaceholder = useMemo(
+    () => !imageProps.source || isError,
+    [imageProps.source, isError],
+  );
+
+  const handleLoadStart = useCallback(() => setIsLoading(true), []);
+  const handleLoadEnd = useCallback(() => setIsLoading(false), []);
+  const handleError = useCallback(() => {
+    setIsError(true);
+    setIsLoading(false);
+  }, []);
 
   return (
     <View style={containerStyle}>
       <MemoizedBaseSkeleton isLoading={isLoading} />
       {showPlaceholder ? (
-        <View style={{ flex: 1, backgroundColor: '#EEEEEE' }} />
+        <View style={styles.placeholder} />
       ) : (
         <DefaultFastImage
           resizeMode={DefaultFastImage.resizeMode.cover}
-          onLoadStart={useCallback(() => setIsLoading(true), [])}
-          onLoadEnd={useCallback(() => setIsLoading(false), [])}
-          onError={useCallback(() => { setIsError(true); setIsLoading(false); }, [])}
-          style={{ flex: 1 }}
+          onLoadStart={handleLoadStart}
+          onLoadEnd={handleLoadEnd}
+          onError={handleError}
+          style={styles.image}
           {...imageProps}
         />
       )}
     </View>
   );
 };
+
+const styles = StyleSheet.create({
+  placeholder: { flex: 1, backgroundColor: '#EEEEEE' },
+  image: { flex: 1 },
+});
 ```
+
+> Three things changed from the original snippet: (1) handlers are hoisted out of JSX so they get stable identities (calling `useCallback` inline in props means new function refs every render — bypassing memoization on the underlying `<DefaultFastImage>`); (2) inline `{flex: 1}` styles moved into `StyleSheet.create` — required by the `react-native/no-inline-styles` ESLint rule; (3) styles use `StyleSheet.create` rather than the `useThemeStyles` hook because the placeholder colour is intentionally non-themed (it shows briefly while the real image loads and a themed background would still flash).
 
 Add `src/components/core/image/index.ts` and `src/components/core/index.ts` barrels.
 
 ### 6.3 BaseList (FlashList Wrapper) — `src/components/list/BaseList.tsx`
 
 ```typescript
-import { forwardRef } from 'react';
+import { forwardRef, Ref } from 'react';
+
 import { FlashList, FlashListProps, FlashListRef } from '@shopify/flash-list';
 
-const BaseListInner = forwardRef<FlashListRef<unknown>, FlashListProps<unknown>>((props, ref) => (
+const BaseListInner = forwardRef<
+  FlashListRef<unknown>,
+  FlashListProps<unknown>
+>((props, ref) => (
   <FlashList
     bounces={false}
     showsVerticalScrollIndicator={false}
@@ -517,16 +617,18 @@ const BaseListInner = forwardRef<FlashListRef<unknown>, FlashListProps<unknown>>
 ));
 
 export function BaseList<ItemT>(
-  props: FlashListProps<ItemT> & { ref?: React.Ref<FlashListRef<ItemT>> },
+  props: FlashListProps<ItemT> & { ref?: Ref<FlashListRef<ItemT>> },
 ) {
   return (
     <BaseListInner
       {...(props as FlashListProps<unknown>)}
-      ref={props.ref as React.Ref<FlashListRef<unknown>>}
+      ref={props.ref as Ref<FlashListRef<unknown>>}
     />
   );
 }
 ```
+
+> The cast through `FlashListProps<unknown>` is unavoidable: `forwardRef` can't be generic over `ItemT` directly, so we wrap a non-generic `forwardRef` and re-introduce the generic via a function component. This is the conventional FlashList wrapper pattern.
 
 Add `src/components/list/index.ts` barrel.
 
@@ -540,12 +642,18 @@ Add `src/components/list/index.ts` barrel.
 ### 6.4 ScreenWrapper — `src/components/wrappers/ScreenWrapper.tsx`
 
 ```typescript
-import { useMemo } from 'react';
-import { SafeAreaView, SafeAreaViewProps } from 'react-native-safe-area-context';
+import { ReactNode, useMemo } from 'react';
+
+import {
+  Edge,
+  SafeAreaView,
+  SafeAreaViewProps,
+} from 'react-native-safe-area-context';
+
 import { useThemeStyles } from '@/hooks';
 
 export type ScreenWrapperProps = {
-  children?: React.ReactNode;
+  children?: ReactNode;
   enableTopSafeArea?: boolean;
   enableBottomSafeArea?: boolean;
 } & SafeAreaViewProps;
@@ -558,17 +666,25 @@ export const ScreenWrapper = ({
 }: ScreenWrapperProps) => {
   const styles = useScreenWrapperStyles();
 
-  const edges = useMemo(() => {
-    const e: SafeAreaViewProps['edges'] = ['left', 'right'];
-    if (!enableTopSafeArea) e.push('top');
-    if (!enableBottomSafeArea) e.push('bottom');
+  const edges = useMemo<Edge[]>(() => {
+    const e: Edge[] = ['left', 'right'];
+    if (!enableTopSafeArea) {
+      e.push('top');
+    }
+    if (!enableBottomSafeArea) {
+      e.push('bottom');
+    }
     return e;
   }, [enableTopSafeArea, enableBottomSafeArea]);
 
   return (
     <>
       {enableTopSafeArea && <SafeAreaView edges={['top']} />}
-      <SafeAreaView edges={edges} {...containerProps} style={[styles.container, containerProps?.style]}>
+      <SafeAreaView
+        edges={edges}
+        {...containerProps}
+        style={[styles.container, containerProps?.style]}
+      >
         {children}
       </SafeAreaView>
       {enableBottomSafeArea && <SafeAreaView edges={['bottom']} />}
@@ -582,10 +698,14 @@ const useScreenWrapperStyles = () =>
   }));
 ```
 
+> **Why `Edge[]` and not `SafeAreaViewProps['edges']`:** in `react-native-safe-area-context@5+`, `edges` is typed as `readonly Edge[]`, so the original `const e: SafeAreaViewProps['edges'] = [...]; e.push(...)` fails — `.push()` doesn't exist on readonly arrays. Importing the `Edge` type and declaring a plain mutable array is the fix.
+
 ### 6.5 KeyboardAwareSVWrapper — `src/components/wrappers/KeyboardAwareSVWrapper.tsx`
 
 ```typescript
 import { forwardRef } from 'react';
+import { StyleSheet } from 'react-native';
+
 import {
   KeyboardAwareScrollView,
   KeyboardAwareScrollViewProps,
@@ -604,10 +724,16 @@ export const KeyboardAwareSVWrapper = forwardRef<
     showsHorizontalScrollIndicator={false}
     {...props}
     ref={ref}
-    style={[{ flex: 1 }, props?.style]}
+    style={[styles.fill, props?.style]}
   />
 ));
+
+const styles = StyleSheet.create({
+  fill: { flex: 1 },
+});
 ```
+
+> **Important:** for `KeyboardAwareScrollView` to actually respond to the keyboard, the app must mount `<KeyboardProvider>` (from the same package) somewhere above it — see Step 7.
 
 Add `src/components/wrappers/index.ts` barrel.
 
@@ -615,16 +741,22 @@ Add `src/components/wrappers/index.ts` barrel.
 
 ## Step 7 — AppWrapper (Root Providers)
 
-### `src/components/wrapper/AppWrapper.tsx`
+Look up the API-layer choice the user made in `rn-setup` (Q3). Generate the variant that matches:
+
+### Variant A — `rn-setup` chose REST + React Query
+
+```bash
+yarn add @tanstack/react-query
+```
 
 ```typescript
 import { PropsWithChildren } from 'react';
+import { StyleSheet } from 'react-native';
+
 import { BottomSheetModalProvider } from '@gorhom/bottom-sheet';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-
-const gestureHandlerStyle = { flex: 1 };
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -634,20 +766,81 @@ const queryClient = new QueryClient({
 
 export const AppWrapper = ({ children }: PropsWithChildren) => (
   <QueryClientProvider client={queryClient}>
-    <GestureHandlerRootView style={gestureHandlerStyle}>
+    <GestureHandlerRootView style={styles.root}>
       <SafeAreaProvider>
-        <BottomSheetModalProvider>
-          {children}
-        </BottomSheetModalProvider>
+        <BottomSheetModalProvider>{children}</BottomSheetModalProvider>
       </SafeAreaProvider>
     </GestureHandlerRootView>
   </QueryClientProvider>
 );
+
+const styles = StyleSheet.create({ root: { flex: 1 } });
 ```
 
-Update `App.tsx` to wrap the root navigator with `AppWrapper`.
+### Variant B — `rn-setup` chose GraphQL (Apollo) or `None`
 
-> **If `rn-setup` chose Apollo Client (GraphQL):** wrap `ApolloProvider` OUTSIDE `AppWrapper` in `App.tsx` — Apollo should be the outermost provider so any descendant (including `AppWrapper`'s children) can use Apollo hooks. `AppWrapper` itself wraps React Query unconditionally; if you don't use React Query, you can safely strip `QueryClientProvider` from `AppWrapper`. If `rn-setup` chose REST + React Query, `AppWrapper`'s `QueryClientProvider` is already correct as-is.
+Do NOT install `@tanstack/react-query` (it's dead weight when Apollo owns the cache, and inflates the bundle). Strip `QueryClientProvider` from `AppWrapper`:
+
+```typescript
+import { PropsWithChildren } from 'react';
+import { StyleSheet } from 'react-native';
+
+import { BottomSheetModalProvider } from '@gorhom/bottom-sheet';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+
+export const AppWrapper = ({ children }: PropsWithChildren) => (
+  <GestureHandlerRootView style={styles.root}>
+    <SafeAreaProvider>
+      <BottomSheetModalProvider>{children}</BottomSheetModalProvider>
+    </SafeAreaProvider>
+  </GestureHandlerRootView>
+);
+
+const styles = StyleSheet.create({ root: { flex: 1 } });
+```
+
+> **Why two variants:** the previous template installed `@tanstack/react-query` unconditionally. If `rn-setup` chose Apollo, that package is unused and the `QueryClientProvider` is a no-op — better to remove both than ship dead code. If the user genuinely needs both libraries side-by-side later (Apollo for GraphQL, React Query for REST), they can `yarn add @tanstack/react-query` and re-add the provider.
+
+### Update `App.tsx`
+
+Wrap the root navigator with `AppWrapper`, **and** mount `<KeyboardProvider>` (from `react-native-keyboard-controller`) so `KeyboardAwareSVWrapper` works. The provider order is:
+
+1. API provider (`ApolloProvider` or skip for REST — React Query is inside `AppWrapper`)
+2. `KeyboardProvider`
+3. `AppWrapper` (GestureHandler → SafeArea → BottomSheetModal)
+4. `NavigationContainer`
+5. `RootNavigator`
+
+Example (Apollo / GraphQL flow):
+
+```typescript
+import { ApolloProvider } from '@apollo/client/react';
+import { NavigationContainer } from '@react-navigation/native';
+import { KeyboardProvider } from 'react-native-keyboard-controller';
+
+import { AppWrapper } from '@/components';
+import { RootNavigator } from '@/navigation';
+import { apolloClient } from '@/services';
+
+function App() {
+  return (
+    <ApolloProvider client={apolloClient}>
+      <KeyboardProvider>
+        <AppWrapper>
+          <NavigationContainer>
+            <RootNavigator />
+          </NavigationContainer>
+        </AppWrapper>
+      </KeyboardProvider>
+    </ApolloProvider>
+  );
+}
+
+export default App;
+```
+
+> Apollo is outermost so any descendant can call Apollo hooks. `KeyboardProvider` must mount somewhere above any `KeyboardAwareScrollView`/`KeyboardAvoidingView` from the library — putting it just inside the API provider keeps reach maximal without polluting the API context.
 
 ---
 
@@ -657,7 +850,8 @@ Replace (or create) `src/screens/Home/HomeScreen.tsx` with this themed example s
 
 ```typescript
 import { Text, View } from 'react-native';
-import { ScreenWrapper } from '@/components/wrappers';
+
+import { ScreenWrapper } from '@/components';
 import { useThemeStyles } from '@/hooks';
 import { spacing, typography } from '@/theme';
 
@@ -695,20 +889,25 @@ Ensure every folder under `src/` has an `index.ts` that re-exports its contents:
 
 - `src/components/index.ts` — exports from `core/`, `skeleton/`, `list/`, `wrappers/`, `wrapper/`
 - `src/hooks/index.ts` — exports `useThemeStyles`, `useThemeValues`
-- `src/theme/index.ts` — exports everything
+- `src/theme/index.ts` — exports `ThemeResources`, `ThemeColorsType`, `typography`, `fontFamily`, `spacing`, `SpacingKey`, `FlexBoxStyles`
 - `src/types/index.ts` — exports `NamedStyles`
-- `src/zustand/index.ts` — exports `ThemeState`
+- `src/store/index.ts` — extends the rn-setup barrel to re-export `themeStore` alongside `authStore` and `storage`
 
 ---
 
-## Step 10 — iOS Pod Install + Verify Build
+## Step 10 — iOS Pod Install + Verify
 
 ```bash
 cd ios && pod install && cd ..
-yarn ios  # or yarn android
+yarn lint --fix     # autofix import order, surface any rule violations
+npx tsc --noEmit    # MUST exit 0 — catches Edge[], ThemeColorsType, ColorScheme drift
+yarn test           # MUST exit 0 — passWithNoTests:true covers the empty case
+yarn ios            # or yarn android
 ```
 
-Verify the app builds and runs without errors. If a font was configured in Step 0, also verify text renders in that font (drop the `.ttf` files first if you haven't).
+All three checks (`lint`, `tsc`, `test`) must pass before declaring done. If `tsc` reports errors, **stop** — they almost always indicate a version-API drift in one of the snippets (StyleSheet, Edge, ColorScheme, Apollo subpath, etc.). Fix in this skill, then re-run.
+
+If a font was configured in Step 0, also verify text renders in that font (drop the `.ttf` files first if you haven't).
 
 ---
 
@@ -718,8 +917,8 @@ Verify the app builds and runs without errors. If a font was configured in Step 
 - Do NOT change bundle ID or applicationId
 - All imports MUST use `@/` aliases
 - Every folder MUST have barrel `index.ts`
-- Styles via `useThemeStyles` hook — never `StyleSheet.create` in components
-- No anonymous functions in JSX props (use `useCallback` + named handlers) — critical for FlashList item performance
+- **Themed styles MUST use `useThemeStyles`.** Static styles that never depend on theme (e.g. `flex: 1`, absolute-fill shells, placeholder colours that show only briefly) are fine in `StyleSheet.create`. Never write inline `style={{ ... }}` object literals in JSX — that triggers the `react-native/no-inline-styles` rule and breaks referential equality on every render.
+- No anonymous functions in JSX props (use `useCallback` + named handlers) — critical for FlashList item performance. Don't call `useCallback` *inline* in a JSX prop either; hoist the handler above the `return`.
 - If the user replied `skip` to the font question, do NOT add any font package or `.ttf` reference
 - If the project already has any of these files, skip — do not overwrite
-- Run `yarn lint --fix` after all files are created
+- Run `yarn lint --fix`, `npx tsc --noEmit`, and `yarn test` at the end — all three must pass

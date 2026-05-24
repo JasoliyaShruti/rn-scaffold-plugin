@@ -113,25 +113,50 @@ Update `tsconfig.json`:
 
 ### 2.4 Code Quality (ESLint + Prettier + Husky + Testing)
 
-Install dev deps: `eslint-plugin-import`, `eslint-import-resolver-typescript`, `husky`, `lint-staged`, `@testing-library/react-native`
+Install dev deps: `eslint-plugin-import`, `eslint-import-resolver-typescript`, `husky`, `lint-staged@^16`, `@testing-library/react-native`
+
+> **Why `lint-staged@^16`:** v17 declares `"engines": { "node": ">=22.22.1" }`. Many machines run Node 22.x at minor versions below `.22.1` (which is the `.nvmrc` we pin in 2.5 as `22`). Yarn errors out on that engine mismatch. v16 has the same feature surface and works on any Node 22.
 
 **ESLint** — update `.eslintrc.js`:
-- Add `eslint-plugin-import`
+- Add `eslint-plugin-import` with `plugin:import/recommended` + `plugin:import/typescript` extends, `import/resolver.typescript` set to `./tsconfig.json`
 - `import/order` rule: external (react/react-native first) > builtin > internal (@/**) > parent/sibling > type. Alphabetize, newlines between groups.
 - `react-hooks/exhaustive-deps`: `warn` (NOT off — turning it off hides stale closure bugs)
-- `@typescript-eslint/no-unused-vars`: `error` with `ignoreRestSiblings: true`
+- `@typescript-eslint/no-unused-vars`: `error` with `ignoreRestSiblings: true`, `argsIgnorePattern: '^_'`, `varsIgnorePattern: '^_'`
 
 **Prettier** — ensure `.prettierrc.js` has: `singleQuote: true`, `trailingComma: 'all'`, `bracketSpacing: true`
 
 **Husky + lint-staged:**
 - Add `"prepare": "husky"` to scripts
-- Add lint-staged config to package.json
+- Add lint-staged config to package.json (eslint --fix + prettier --write on ts/tsx/js/jsx; prettier --write on json/md)
 - Run `npx husky init`, set `.husky/pre-commit` to `npx lint-staged`
 
-**Testing** — `@testing-library/react-native` is installed. The RN template's Jest preset is enabled by default in package.json (`"jest": { "preset": "@react-native/jest-preset" }`). Add a coverage script:
+**Testing** — `@testing-library/react-native` is installed. Update `jest.config.js`:
+```js
+module.exports = {
+  preset: '@react-native/jest-preset',
+  moduleNameMapper: {
+    '^@/(.*)$': '<rootDir>/src/$1',
+  },
+  passWithNoTests: true,
+};
+```
+
+> **Why `moduleNameMapper`:** the RN preset uses `babel-jest`, so the `@/` Babel alias from 2.3 *would* transform import paths — but Jest's module resolver runs before Babel for matching, so unmatched `@/foo` resolves to nothing and tests fail with `Cannot find module '@/foo'`. The explicit mapper points Jest at the same `src/` root.
+>
+> **Why `passWithNoTests: true`:** we delete the template `__tests__/App.test.tsx` below, and `jest` exits 1 on an empty test run otherwise. The flag flips that to 0. Real tests (added per the rules below) override the no-tests case anyway.
+
+Add a coverage script in `package.json`:
 ```json
 "test:coverage": "jest --coverage"
 ```
+
+**Delete the template App snapshot test:**
+
+```bash
+rm __tests__/App.test.tsx
+```
+
+> The default RN template ships an `App.test.tsx` that renders the entire `<App />` tree with `react-test-renderer`. That worked for a bare template, but once `App.tsx` is wrapped with `ApolloProvider` / `NavigationContainer` / `GestureHandlerRootView` / MMKV-backed Zustand stores (all native modules), the snapshot test cascades into needing mocks for 6+ libraries. The maintenance burden isn't worth it for a placeholder test. The convention below (one test per hook/util/screen) is what catches regressions.
 
 **Testing rules** (enforce in code review):
 - Every custom hook in `src/hooks/` must have a unit test.
@@ -226,20 +251,24 @@ Install: `zustand`, `react-native-mmkv`, `react-native-nitro-modules`
 
 Create `src/store/storage.ts`:
 ```typescript
-import { MMKV } from 'react-native-mmkv';
+import { createMMKV } from 'react-native-mmkv';
 import type { StateStorage } from 'zustand/middleware';
 
-export const mmkv = new MMKV({
+export const mmkv = createMMKV({
   id: 'app-storage',
   encryptionKey: 'app-storage-key', // override per-project; for sensitive prod use, fetch from Keychain/Keystore at boot
 });
 
 export const zustandMMKVStorage: StateStorage = {
-  getItem: (name) => mmkv.getString(name) ?? null,
+  getItem: name => mmkv.getString(name) ?? null,
   setItem: (name, value) => mmkv.set(name, value),
-  removeItem: (name) => mmkv.delete(name),
+  removeItem: name => {
+    mmkv.remove(name);
+  },
 };
 ```
+
+> **MMKV v4 API:** the constructor moved from `new MMKV({...})` to `createMMKV({...})` (it now returns a Nitro hybrid object, not a class instance). Likewise the delete method is `remove(key)` rather than `delete(key)`. If you're pinned to MMKV v2/v3 instead, use the old API.
 
 Create `src/store/authStore.ts`:
 ```typescript
@@ -306,23 +335,50 @@ Create `src/services/queryClient.ts`:
 - 5 min stale time, 2 retries, 10 min gcTime
 
 **GraphQL (Apollo):**
-Install: `@apollo/client`, `graphql`
+Install: `@apollo/client`, `graphql`, `rxjs`
+
+> **Why `rxjs`:** Apollo Client v4 (current major) replaced its `zen-observable` internals with RxJS and declares `rxjs@^7.3.0` as a peer dependency. Yarn Classic does NOT auto-install peers — without it, queries/mutations throw at runtime the first time they construct an observable. (If you pin `@apollo/client@^3`, you can drop `rxjs`.)
 
 Create `src/services/apolloClient.ts`:
-- HttpLink with `ENV.API_BASE_URL`
-- authLink to inject token
-- InMemoryCache
+```typescript
+import { ApolloClient, HttpLink, InMemoryCache } from '@apollo/client';
+import { setContext } from '@apollo/client/link/context';
+
+import { ENV } from '@/constants';
+import { useAuthStore } from '@/store';
+
+const httpLink = new HttpLink({ uri: ENV.API_BASE_URL });
+
+const authLink = setContext((_, { headers }) => {
+  const token = useAuthStore.getState().token;
+  return {
+    headers: {
+      ...headers,
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+  };
+});
+
+export const apolloClient = new ApolloClient({
+  link: authLink.concat(httpLink),
+  cache: new InMemoryCache(),
+});
+```
+
+> **Apollo v4 import paths:** `ApolloProvider` ships from `@apollo/client/react` (not `@apollo/client`). React bindings are split into their own subpath so the core client can be tree-shaken in non-React environments. Make sure App.tsx in 2.10 uses `import { ApolloProvider } from '@apollo/client/react'`.
 
 Update barrel in `src/services/index.ts`.
 
 ### 2.10 Wire Up App.tsx
 
 Update `App.tsx` to wrap with the chosen providers in this order (outer → inner):
-1. `QueryClientProvider` or `ApolloProvider` (if API chosen)
+1. `QueryClientProvider` (from `@tanstack/react-query`) or `ApolloProvider` (from `@apollo/client/react`) (if API chosen)
 2. Redux `Provider` (if Redux chosen)
 3. `SafeAreaProvider`
 4. `NavigationContainer` (if navigation chosen)
 5. `RootNavigator` or existing app content
+
+> Apollo `ApolloProvider` import: `from '@apollo/client/react'` (NOT `@apollo/client`) — see 2.9.
 
 **IMPORTANT: Remove template packages that are no longer used after rewiring:**
 
@@ -336,11 +392,20 @@ This package is part of the default RN template and is always replaced by the cu
 
 Run `pod install` in the `ios/` directory to link new native modules.
 
-### 2.12 Final Cleanup
+### 2.12 Final Verification & Cleanup
 
-- Run `yarn lint --fix` (or equivalent) to auto-fix import ordering
-- Remove any unused packages from dependencies
-- Verify lint passes clean
+Run all three checks before declaring the scaffold done — silence on any of these is the only acceptable success signal:
+
+```bash
+yarn lint --fix                # autofix import order, etc.
+npx tsc --noEmit               # MUST exit 0 — catches API drift like MMKV v4
+yarn test                      # MUST exit 0 — with passWithNoTests: true this passes the empty case
+```
+
+- Remove any unused packages from dependencies (the only one this scaffold typically removes is `@react-native/new-app-screen`, already covered in 2.10)
+- `yarn lint` may report `import/no-named-as-default` warnings for `react-native-config` and (if you kept it) `react-test-renderer` — both are default-only exports. These warnings are benign; leave them.
+
+If `tsc` reports errors, do NOT proceed — they almost always indicate a version-API mismatch (e.g. MMKV constructor, Apollo subpath, ColorScheme typing). Fix the snippet locally before continuing.
 
 ### 2.13 Update CLAUDE.md
 
