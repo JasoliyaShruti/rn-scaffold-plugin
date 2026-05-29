@@ -14,7 +14,7 @@ Install production dependencies and create the theme system, core hooks, core co
 
 ## Step 0 — Ask Preferences
 
-Ask the user these two questions before any installs. They control the theme and typography setup. Present them in a single message:
+Ask the user these three questions before any installs. They control the theme, typography, and storage encryption. Present them in a single message:
 
 ### Q1. Brand Colors
 "Do you have brand colors for this project? Provide hex codes (e.g. `primary: #FF6B00, secondary: #1B1B1B`) or reply `skip` to use a neutral black/white default palette."
@@ -28,7 +28,18 @@ Ask the user these two questions before any installs. They control the theme and
 - If a name is provided, set the `fontFamily` constants to `<Name>-Regular`, `<Name>-Medium`, `<Name>-SemiBold`, `<Name>-Bold`. After setup, tell the user to drop the corresponding `.ttf` files into `src/assets/fonts/` and run `npx react-native-asset` (or set up `react-native.config.js`) to link them.
 - If `skip`, set every `fontFamily` value to `undefined` so React Native uses the system font. Do NOT install any font package.
 
-Wait for both answers before proceeding.
+### Q3. Encrypted Local Storage (recommended)
+"Encrypt local storage with a randomly-generated key stored in the device Keychain (iOS) / Keystore (Android)? [Y/n — recommended for production]"
+
+- Default is **Yes**. Reply `n` only if this is a throwaway prototype.
+- **What it does:** generates a 32-byte random key on first launch, stores it in the OS Keychain/Keystore (`AFTER_FIRST_UNLOCK` accessibility), and uses it to encrypt MMKV at rest. The key never appears in your bundle or source. Adds an async bootstrap gate to `App.tsx` (renders blank for ~50–150ms on first launch while reading the Keychain).
+- **Tradeoffs to flag to the user:**
+  - **Key rotation is destructive.** Once values are encrypted with this key, you can't decrypt them with a different key — rotating means re-encrypting every value or wiping state on next launch. Plan a migration path before launch.
+  - **Adds two deps:** `react-native-keychain`, `react-native-get-random-values`. Both maintained, both small. iOS Keychain APIs require a quick re-`pod install`.
+  - **Doesn't protect from compromised devices** — a rooted/jailbroken device with the app's process can still read the decrypted in-memory copy. This is at-rest protection only, valuable for stolen-device and offline-backup scenarios.
+- Skip applies if the user picked `None` for state management in `/rn-setup` — there's nothing to encrypt yet.
+
+Wait for all three answers before proceeding.
 
 ---
 
@@ -69,7 +80,23 @@ yarn add @shopify/flash-list @gorhom/bottom-sheet @d11/react-native-fast-image r
 yarn add react-native-mmkv react-native-nitro-modules
 ```
 
-> `react-native-nitro-modules` is a required peer dependency of `react-native-mmkv`. Always install it alongside mmkv. MMKV supports its own encryption via the `encryptionKey` option — sufficient for most apps. Add `react-native-encrypted-storage` separately only if you need OS-level keychain/keystore for biometric tokens or similar.
+> `react-native-nitro-modules` is a required peer dependency of `react-native-mmkv`. Always install it alongside mmkv.
+
+**If Q3 = Yes (encrypted storage):** install Keychain + a crypto-secure RNG polyfill:
+
+```bash
+yarn add react-native-keychain react-native-get-random-values
+```
+
+> **Why these two:** `react-native-keychain` is the bridge to iOS Keychain and Android Keystore — that's where we stash the encryption key so it never lands in the JS bundle, source control, or backups. `react-native-get-random-values` polyfills `crypto.getRandomValues()` (which RN's JS engine doesn't ship by default), used to generate the 32-byte random key on first launch. Without the polyfill, `crypto.getRandomValues` is undefined and key generation throws at runtime.
+
+**If `/rn-setup` picked Redux Toolkit AND Q3 = Yes:** also install `redux-persist` for the persistence wrapper used in Step 4:
+
+```bash
+yarn add redux-persist
+```
+
+> Redux + encrypted storage = persist `auth` selectively via `redux-persist` with the encrypted-MMKV adapter. The persistence is whitelisted (auth slice only) — see Step 4. If Q3 = No, skip this install; Redux stays memory-only and matches what `/rn-setup` scaffolded.
 
 ### Keyboard
 
@@ -354,11 +381,254 @@ export type { NamedStyles } from './styleTypes';
 
 ---
 
-## Step 4 — Zustand Theme Store (with OS dark mode integration)
+## Step 4 — Stores (Storage + Auth + Theme)
 
-### `src/store/themeStore.ts`
+This step writes the store files that `/rn-setup` deliberately deferred. Three sub-steps:
 
-> **Why `src/store/` and not `src/zustand/`:** `rn-setup` already created `src/store/` for Zustand stores (`authStore.ts`, `storage.ts`). Adding a separate `src/zustand/` folder would split state across two parallel locations. Naming this file `themeStore.ts` mirrors `authStore.ts`; the exported hook is `useThemeState` to match `useAuthStore`.
+- **4.1** Storage primitive (`storage.ts`) — encrypted MMKV bootstrap if Q3 = Yes; simple MMKV otherwise.
+- **4.2** Auth store — Zustand `authStore.ts` OR Redux `store.ts` upgrade with `redux-persist`, depending on what `/rn-setup` chose.
+- **4.3** Theme store (`themeStore.ts`) — universal, Zustand-based, with OS dark-mode integration.
+
+If `/rn-setup` Q2 was `None` (no state management), skip 4.1 and 4.2; do only 4.3.
+
+---
+
+### 4.1 Storage primitive — `src/store/storage.ts`
+
+**Variant A — Q3 = Yes (encrypted, recommended for production):**
+
+```typescript
+import 'react-native-get-random-values';
+
+import { createMMKV, MMKV } from 'react-native-mmkv';
+import * as Keychain from 'react-native-keychain';
+
+const KEYCHAIN_SERVICE = 'app-storage-encryption';
+
+const generateRandomKey = (): string => {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes)
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+};
+
+const getOrCreateEncryptionKey = async (): Promise<string> => {
+  const existing = await Keychain.getGenericPassword({ service: KEYCHAIN_SERVICE });
+  if (existing && existing.password) {
+    return existing.password;
+  }
+  const key = generateRandomKey();
+  await Keychain.setGenericPassword('mmkv-key', key, {
+    service: KEYCHAIN_SERVICE,
+    accessible: Keychain.ACCESSIBLE.AFTER_FIRST_UNLOCK,
+  });
+  return key;
+};
+
+let mmkv: MMKV | null = null;
+
+export const bootstrapStorage = async (): Promise<MMKV> => {
+  if (mmkv) {
+    return mmkv;
+  }
+  const key = await getOrCreateEncryptionKey();
+  mmkv = createMMKV({ id: 'app-storage', encryptionKey: key });
+  return mmkv;
+};
+
+export const getStorage = (): MMKV => {
+  if (!mmkv) {
+    throw new Error('Storage not bootstrapped. Await bootstrapStorage() before reading.');
+  }
+  return mmkv;
+};
+```
+
+If `/rn-setup` chose **Zustand**, also export the adapter:
+
+```typescript
+import type { StateStorage } from 'zustand/middleware';
+
+export const zustandMMKVStorage: StateStorage = {
+  getItem: name => getStorage().getString(name) ?? null,
+  setItem: (name, value) => getStorage().set(name, value),
+  removeItem: name => {
+    getStorage().remove(name);
+  },
+};
+```
+
+If `/rn-setup` chose **Redux**, also export the redux-persist adapter:
+
+```typescript
+import type { Storage } from 'redux-persist';
+
+export const reduxPersistMMKVStorage: Storage = {
+  setItem: (key, value) => {
+    getStorage().set(key, value);
+    return Promise.resolve(true);
+  },
+  getItem: key => Promise.resolve(getStorage().getString(key) ?? null),
+  removeItem: key => {
+    getStorage().remove(key);
+    return Promise.resolve();
+  },
+};
+```
+
+**Also update `index.js`** (the RN entry file, not `App.tsx`) so the crypto polyfill loads before *anything* else:
+
+```js
+import 'react-native-get-random-values';   // MUST be the first import
+import { AppRegistry } from 'react-native';
+
+import App from './App';
+import { name as appName } from './app.json';
+
+AppRegistry.registerComponent(appName, () => App);
+```
+
+> **Why polyfill ordering matters:** `getOrCreateEncryptionKey` calls `crypto.getRandomValues`. RN's JS engine (Hermes / JSC) doesn't ship that API by default — without the polyfill loaded first, the call throws `ReferenceError: crypto is not defined` before the storage bootstrap can finish. The `App.tsx`-level import is too late if any other module touches `crypto` during eager evaluation.
+
+**Variant B — Q3 = No (simple, prototype-only):**
+
+```typescript
+import { createMMKV } from 'react-native-mmkv';
+import type { StateStorage } from 'zustand/middleware'; // Zustand path
+// import type { Storage } from 'redux-persist';        // Redux path
+
+export const mmkv = createMMKV({ id: 'app-storage' });
+
+// Zustand adapter:
+export const zustandMMKVStorage: StateStorage = {
+  getItem: name => mmkv.getString(name) ?? null,
+  setItem: (name, value) => mmkv.set(name, value),
+  removeItem: name => {
+    mmkv.remove(name);
+  },
+};
+```
+
+> **No encryption, no key.** Anyone with filesystem access to the unpacked app can read these values in plaintext. Acceptable for prototypes; **not** acceptable for shipping a customer-facing build. Re-run `/rn-core` with Q3 = Yes before launch.
+
+> **MMKV v4 API:** the constructor is `createMMKV({...})` (returns a Nitro hybrid object), the delete method is `remove(key)`. If you're pinned to v2/v3, use the old `new MMKV({...})` + `delete(key)` API.
+
+---
+
+### 4.2 Auth store
+
+**If `/rn-setup` chose Zustand — create `src/store/authStore.ts`:**
+
+```typescript
+import { create } from 'zustand';
+import { createJSONStorage, persist } from 'zustand/middleware';
+
+import { zustandMMKVStorage } from './storage';
+
+interface User {
+  id: string;
+  name: string;
+  email: string;
+}
+
+interface AuthState {
+  token: string | null;
+  user: User | null;
+  isAuthenticated: boolean;
+  setAuth: (token: string, user: User) => void;
+  clearAuth: () => void;
+}
+
+export const useAuthStore = create<AuthState>()(
+  persist(
+    set => ({
+      token: null,
+      user: null,
+      isAuthenticated: false,
+      setAuth: (token, user) => set({ token, user, isAuthenticated: true }),
+      clearAuth: () => set({ token: null, user: null, isAuthenticated: false }),
+    }),
+    {
+      name: 'auth-storage',
+      storage: createJSONStorage(() => zustandMMKVStorage),
+      // Q3 = Yes only: storage is encrypted and bootstrapped asynchronously, so
+      // we must defer hydration until App.tsx awaits bootstrapStorage().
+      skipHydration: true,
+    },
+  ),
+);
+```
+
+> If Q3 = No, omit `skipHydration: true` — the simple MMKV instance is ready synchronously, no gate needed.
+
+**Persistence rule (both Zustand and Redux):** future stores that hold transient commerce data (cart, search results, query cache) **must not** use `persist`. Persist identity (`auth`, `userPreferences`); fetch the rest fresh on cold start. Stale prices and stale inventory are real UX problems.
+
+**If `/rn-setup` chose Redux AND Q3 = Yes — overwrite `src/store/store.ts`:**
+
+```typescript
+import { combineReducers, configureStore } from '@reduxjs/toolkit';
+import {
+  FLUSH,
+  PAUSE,
+  PERSIST,
+  persistReducer,
+  persistStore,
+  PURGE,
+  REGISTER,
+  REHYDRATE,
+} from 'redux-persist';
+
+import authReducer from './slices/authSlice';
+import { reduxPersistMMKVStorage } from './storage';
+
+const rootReducer = combineReducers({
+  auth: authReducer,
+  // Add new slices here. Only whitelist the ones that should survive restarts.
+});
+
+const persistedReducer = persistReducer(
+  {
+    key: 'root',
+    storage: reduxPersistMMKVStorage,
+    whitelist: ['auth'], // persist identity only — see "Persistence rule" above
+  },
+  rootReducer,
+);
+
+export const store = configureStore({
+  reducer: persistedReducer,
+  middleware: getDefaultMiddleware =>
+    getDefaultMiddleware({
+      serializableCheck: {
+        // redux-persist dispatches non-serializable actions during rehydration;
+        // ignore them or the default serializableCheck floods the console.
+        ignoredActions: [FLUSH, REHYDRATE, PAUSE, PERSIST, PURGE, REGISTER],
+      },
+    }),
+});
+
+export const persistor = persistStore(store);
+
+export type RootState = ReturnType<typeof store.getState>;
+export type AppDispatch = typeof store.dispatch;
+```
+
+> **If Q3 = No:** leave `store.ts` exactly as `/rn-setup` wrote it (no `persistReducer`). Redux runs memory-only; nothing survives restarts. Skip the rest of this sub-step.
+
+---
+
+### 4.3 Theme store — `src/store/themeStore.ts`
+
+> **Why this is always a Zustand store, even on Redux projects:** the theme is universal across every project — same shape, three states, OS listener. Re-implementing it as a Redux slice adds a non-trivial amount of boilerplate (action creators, selectors, listener middleware for `Appearance.addChangeListener`) for zero benefit. The skill defaults the theme store to Zustand and treats it as an internal implementation detail.
+
+**If `/rn-setup` did NOT pick Zustand** (i.e. Redux or None), install zustand now — only for the theme store:
+
+```bash
+yarn add zustand
+```
+
+This is the *only* place a Redux-state project mixes in Zustand, and it's intentional: 3 KB, no providers, no boilerplate. Application state stays in Redux; theme state stays here.
 
 ```typescript
 import { Appearance } from 'react-native';
@@ -777,6 +1047,41 @@ export const AppWrapper = ({ children }: PropsWithChildren) => (
 const styles = StyleSheet.create({ root: { flex: 1 } });
 ```
 
+> **Optional — persist React Query cache across launches (opt-in, NOT scaffolded by default):**
+>
+> For offline-first browsing or instant cold-start UI, React Query's cache can be persisted to MMKV via `@tanstack/query-async-storage-persister` + `@tanstack/react-query-persist-client`. **The scaffold deliberately does not install this.** Reasons specific to e-commerce:
+> - **Stale price / inventory risk.** Persisted product queries can show old prices and "in stock" badges that lie. For a checkout-bound flow this is a real UX (and revenue) problem.
+> - **Default `staleTime: 0` works against persistence** — every persisted query refetches on mount anyway, so the cold-start benefit is small unless you also tune `staleTime` and `gcTime` per query.
+> - **Encryption overhead.** Persisted cache holds query data that might include auth-flavoured fields; encrypting it adds CPU on every dehydrate/hydrate cycle.
+>
+> If you genuinely want it, the production-shape pattern is **selective persistence** — only allowlist queries that are safe to serve stale (user profile, app settings, last-viewed-collection IDs), not everything. Sketch:
+>
+> ```typescript
+> import { createAsyncStoragePersister } from '@tanstack/query-async-storage-persister';
+> import { persistQueryClient } from '@tanstack/react-query-persist-client';
+>
+> import { getStorage } from '@/store/storage';
+>
+> const mmkvAsAsyncStorage = {
+>   getItem: (key: string) => Promise.resolve(getStorage().getString(key) ?? null),
+>   setItem: (key: string, value: string) => Promise.resolve(getStorage().set(key, value)),
+>   removeItem: (key: string) => Promise.resolve(getStorage().remove(key)),
+> };
+>
+> persistQueryClient({
+>   queryClient,
+>   persister: createAsyncStoragePersister({ storage: mmkvAsAsyncStorage }),
+>   dehydrateOptions: {
+>     shouldDehydrateQuery: q => {
+>       const allowlist = ['user-profile', 'app-settings'];
+>       return allowlist.includes(q.queryKey[0] as string);
+>     },
+>   },
+> });
+> ```
+>
+> Add this AFTER `bootstrapStorage()` resolves (otherwise `getStorage()` throws). And install `@tanstack/query-async-storage-persister @tanstack/react-query-persist-client` first.
+
 ### Variant B — `rn-setup` chose GraphQL (Apollo) or `None`
 
 Do NOT install `@tanstack/react-query` (it's dead weight when Apollo owns the cache, and inflates the bundle). Strip `QueryClientProvider` from `AppWrapper`:
@@ -841,6 +1146,108 @@ export default App;
 ```
 
 > Apollo is outermost so any descendant can call Apollo hooks. `KeyboardProvider` must mount somewhere above any `KeyboardAwareScrollView`/`KeyboardAvoidingView` from the library — putting it just inside the API provider keeps reach maximal without polluting the API context.
+
+### Storage bootstrap gate (Q3 = Yes only)
+
+Encrypted storage from sub-step 4.1 reads the key from the Keychain asynchronously, so the app must wait for it before rendering anything that reads from storage. Add a gate to `App.tsx`:
+
+**Zustand variant:**
+
+```typescript
+import { useEffect, useState } from 'react';
+
+import { ApolloProvider } from '@apollo/client/react';
+import { NavigationContainer } from '@react-navigation/native';
+import { KeyboardProvider } from 'react-native-keyboard-controller';
+
+import { AppWrapper } from '@/components';
+import { RootNavigator } from '@/navigation';
+import { apolloClient } from '@/services';
+import { bootstrapStorage } from '@/store/storage';
+import { useAuthStore } from '@/store';
+
+function App() {
+  const [storageReady, setStorageReady] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      await bootstrapStorage();
+      await useAuthStore.persist.rehydrate();
+      setStorageReady(true);
+    })();
+  }, []);
+
+  if (!storageReady) {
+    return null; // Or a splash component — render time is ~50–150ms in practice
+  }
+
+  return (
+    <ApolloProvider client={apolloClient}>
+      <KeyboardProvider>
+        <AppWrapper>
+          <NavigationContainer>
+            <RootNavigator />
+          </NavigationContainer>
+        </AppWrapper>
+      </KeyboardProvider>
+    </ApolloProvider>
+  );
+}
+
+export default App;
+```
+
+**Redux variant:**
+
+```typescript
+import { useEffect, useState } from 'react';
+
+import { ApolloProvider } from '@apollo/client/react';
+import { NavigationContainer } from '@react-navigation/native';
+import { KeyboardProvider } from 'react-native-keyboard-controller';
+import { Provider as ReduxProvider } from 'react-redux';
+import { PersistGate } from 'redux-persist/integration/react';
+
+import { AppWrapper } from '@/components';
+import { RootNavigator } from '@/navigation';
+import { apolloClient } from '@/services';
+import { persistor, store } from '@/store/store';
+import { bootstrapStorage } from '@/store/storage';
+
+function App() {
+  const [storageReady, setStorageReady] = useState(false);
+
+  useEffect(() => {
+    bootstrapStorage().then(() => setStorageReady(true));
+  }, []);
+
+  if (!storageReady) {
+    return null;
+  }
+
+  return (
+    <ApolloProvider client={apolloClient}>
+      <ReduxProvider store={store}>
+        <PersistGate loading={null} persistor={persistor}>
+          <KeyboardProvider>
+            <AppWrapper>
+              <NavigationContainer>
+                <RootNavigator />
+              </NavigationContainer>
+            </AppWrapper>
+          </KeyboardProvider>
+        </PersistGate>
+      </ReduxProvider>
+    </ApolloProvider>
+  );
+}
+
+export default App;
+```
+
+> **Two gates, not one.** `bootstrapStorage()` resolves once the encryption key is loaded — that's when `redux-persist` can safely read MMKV. The `<PersistGate>` then waits for `redux-persist` to finish rehydrating the persisted slices before children render. Skipping either gate causes a flash of empty state and, worse, racy writes against an unbootstrapped store.
+
+**Q3 = No:** skip the bootstrap gate entirely. Storage is ready synchronously; render the providers directly as in the example at the top of this step.
 
 ---
 

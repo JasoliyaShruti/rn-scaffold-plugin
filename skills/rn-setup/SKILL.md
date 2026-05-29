@@ -39,6 +39,10 @@ Ask the user these questions in a single message. Present them as a numbered lis
 1. **Yes** — set up `.env.dev/.stage/.prod` with `react-native-config`
 2. **No** — skip for now
 
+### Q6. GitHub Actions CI
+1. **Yes** (recommended) — generate `.github/workflows/` with lint+tsc+test on PR/main and a weekly `yarn audit` dependency check
+2. **No** — skip for now
+
 ---
 
 ## Step 2 — Execute Setup
@@ -122,6 +126,7 @@ Install dev deps: `eslint-plugin-import`, `eslint-import-resolver-typescript`, `
 - `import/order` rule: external (react/react-native first) > builtin > internal (@/**) > parent/sibling > type. Alphabetize, newlines between groups.
 - `react-hooks/exhaustive-deps`: `warn` (NOT off — turning it off hides stale closure bugs)
 - `@typescript-eslint/no-unused-vars`: `error` with `ignoreRestSiblings: true`, `argsIgnorePattern: '^_'`, `varsIgnorePattern: '^_'`
+- `no-console`: `['error', { allow: ['error', 'warn'] }]` — block `console.log/info/debug` at lint time so debug noise never reaches production. `console.error` and `console.warn` are preserved deliberately as the prod-debug escape hatch. Pairs with Metro `pure_funcs` below (defense in depth).
 
 **Prettier** — ensure `.prettierrc.js` has: `singleQuote: true`, `trailingComma: 'all'`, `bracketSpacing: true`
 
@@ -165,6 +170,36 @@ rm __tests__/App.test.tsx
 - Mock at the boundary (Apollo, native modules, network) — never mock internal modules.
 - Tests live in `__tests__/` mirroring the `src/` structure.
 
+**Metro — strip debug console calls from production bundles:**
+
+Write `metro.config.js` at the repo root. The default RN template ships an empty config; replace it with:
+
+```js
+const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
+
+/**
+ * Metro configuration
+ * https://reactnative.dev/docs/metro
+ */
+const config = {
+  transformer: {
+    minifierConfig: {
+      compress: {
+        // Drop these calls entirely from production bundles.
+        // `console.error` and `console.warn` are intentionally preserved as the
+        // prod-debug escape hatch. The ESLint `no-console` rule above blocks
+        // `console.log/info/debug` at author time; this is the runtime safety net.
+        pure_funcs: ['console.log', 'console.info', 'console.debug'],
+      },
+    },
+  },
+};
+
+module.exports = mergeConfig(getDefaultConfig(__dirname), config);
+```
+
+> **Why this AND ESLint `no-console`:** the lint rule catches new calls at commit time. `pure_funcs` is the safety net for `console.*` calls hiding in transitive dependencies — Terser drops them as dead code during release minification, so even a third-party `console.log` left in a node_modules package doesn't ship to users. Together they cover both authored and bundled paths. No extra package needed — the `metro` package shipping with RN already includes Terser.
+
 ### 2.5 Dev Environment Consistency
 
 Create `.nvmrc` at the repo root with:
@@ -191,6 +226,22 @@ trim_trailing_whitespace = false
 ```
 
 This enforces consistent indentation, line endings, and charset across every teammate's IDE.
+
+**Secrets hygiene — extend `.gitignore`:**
+
+Append these patterns to `.gitignore` (skip any that already exist):
+
+```
+# Android signing — never commit release keystores
+*.keystore
+!debug.keystore
+
+# iOS provisioning / signing artefacts
+*.mobileprovision
+*.p12
+```
+
+> **Why:** `*.keystore` blanket-ignores any release keystore a teammate accidentally drops into the repo; `!debug.keystore` re-allows the Android template's default debug key (it's not a secret — every RN project ships the same one). The iOS patterns block accidentally committing Apple provisioning profiles and signing certificates. The `.env.*` patterns are added later in section 2.6 only if env config was chosen.
 
 ### 2.6 Environment (if chosen)
 
@@ -249,34 +300,19 @@ Install: `zustand`, `react-native-mmkv`, `react-native-nitro-modules`
 
 > `react-native-nitro-modules` is a required peer dep of `react-native-mmkv`. Always install them together.
 
-Create `src/store/storage.ts`:
+> **Storage + auth store templates live in `/rn-core`, not here.** `/rn-core` Step 0 asks the user whether to use Keychain-encrypted storage and then writes the matching `src/store/storage.ts` + `src/store/authStore.ts` (encrypted variant uses `react-native-keychain` + a randomly-generated key bootstrapped on first launch; unencrypted variant uses MMKV with no key). Keeping the templates in one place avoids two skills writing the same file and lets the encryption choice live alongside the work that depends on it. **After `/rn-setup`, run `/rn-core` before launching the app — the Zustand store files will be missing until then.**
+
+App.tsx wiring is handled by `/rn-core` Step 7 (it knows whether the storage needs an async bootstrap gate based on the encryption choice).
+
+**Redux Toolkit:**
+
+Install: `@reduxjs/toolkit`, `react-redux`
+
+Create `src/store/slices/authSlice.ts`:
 ```typescript
-import { createMMKV } from 'react-native-mmkv';
-import type { StateStorage } from 'zustand/middleware';
+import { createSlice, PayloadAction } from '@reduxjs/toolkit';
 
-export const mmkv = createMMKV({
-  id: 'app-storage',
-  encryptionKey: 'app-storage-key', // override per-project; for sensitive prod use, fetch from Keychain/Keystore at boot
-});
-
-export const zustandMMKVStorage: StateStorage = {
-  getItem: name => mmkv.getString(name) ?? null,
-  setItem: (name, value) => mmkv.set(name, value),
-  removeItem: name => {
-    mmkv.remove(name);
-  },
-};
-```
-
-> **MMKV v4 API:** the constructor moved from `new MMKV({...})` to `createMMKV({...})` (it now returns a Nitro hybrid object, not a class instance). Likewise the delete method is `remove(key)` rather than `delete(key)`. If you're pinned to MMKV v2/v3 instead, use the old API.
-
-Create `src/store/authStore.ts`:
-```typescript
-import { create } from 'zustand';
-import { createJSONStorage, persist } from 'zustand/middleware';
-import { zustandMMKVStorage } from './storage';
-
-interface User {
+export interface User {
   id: string;
   name: string;
   email: string;
@@ -286,38 +322,66 @@ interface AuthState {
   token: string | null;
   user: User | null;
   isAuthenticated: boolean;
-  setAuth: (token: string, user: User) => void;
-  clearAuth: () => void;
 }
 
-export const useAuthStore = create<AuthState>()(
-  persist(
-    (set) => ({
-      token: null,
-      user: null,
-      isAuthenticated: false,
-      setAuth: (token, user) => set({ token, user, isAuthenticated: true }),
-      clearAuth: () => set({ token: null, user: null, isAuthenticated: false }),
-    }),
-    {
-      name: 'auth-storage',
-      storage: createJSONStorage(() => zustandMMKVStorage),
+const initialState: AuthState = {
+  token: null,
+  user: null,
+  isAuthenticated: false,
+};
+
+const authSlice = createSlice({
+  name: 'auth',
+  initialState,
+  reducers: {
+    setAuth: (state, action: PayloadAction<{ token: string; user: User }>) => {
+      state.token = action.payload.token;
+      state.user = action.payload.user;
+      state.isAuthenticated = true;
     },
-  ),
-);
+    clearAuth: state => {
+      state.token = null;
+      state.user = null;
+      state.isAuthenticated = false;
+    },
+  },
+});
+
+export const { setAuth, clearAuth } = authSlice.actions;
+export default authSlice.reducer;
 ```
 
-Auth survives app restarts via MMKV. The same `mmkv` instance can be reused for any other persisted store.
+Create `src/store/store.ts` — basic store, NO persistence wiring yet:
+```typescript
+import { configureStore } from '@reduxjs/toolkit';
 
-**Redux Toolkit:**
+import authReducer from './slices/authSlice';
 
-Install: `@reduxjs/toolkit`, `react-redux`
+export const store = configureStore({
+  reducer: {
+    auth: authReducer,
+    // Add new slices here. Persistence is wired in /rn-core if the user opts
+    // into encrypted storage — see /rn-core Step 4 (Redux variant).
+  },
+});
 
-Create `src/store/store.ts` with `configureStore`.
-Create `src/store/hooks.ts` with typed `useAppDispatch` and `useAppSelector`.
-Create `src/store/slices/authSlice.ts` with token, user, login/logout thunks.
+export type RootState = ReturnType<typeof store.getState>;
+export type AppDispatch = typeof store.dispatch;
+```
 
-> Redux persistence (`redux-persist` with an MMKV adapter) is out of scope for this skill — wire it manually if needed.
+Create `src/store/hooks.ts`:
+```typescript
+import { TypedUseSelectorHook, useDispatch, useSelector } from 'react-redux';
+
+import type { AppDispatch, RootState } from './store';
+
+export const useAppDispatch = () => useDispatch<AppDispatch>();
+export const useAppSelector: TypedUseSelectorHook<RootState> = useSelector;
+```
+
+> **Persistence is selective, not blanket.** `/rn-core` upgrades `store.ts` to wrap **only** the auth slice in `persistReducer` (whitelisted), so session identity survives app restarts but transient slices (cart, search, query results) stay fresh. The rule: **persist identity; don't persist commerce state.** Stale prices and stale inventory are real UX problems — fetch them fresh on cold start.
+>
+> If the user declines encryption in `/rn-core`, `store.ts` stays as written above (no persistence at all). Memory-only Redux still works; it just doesn't survive restarts.
 
 Update barrel in `src/store/index.ts`.
 
@@ -407,7 +471,89 @@ yarn test                      # MUST exit 0 — with passWithNoTests: true this
 
 If `tsc` reports errors, do NOT proceed — they almost always indicate a version-API mismatch (e.g. MMKV constructor, Apollo subpath, ColorScheme typing). Fix the snippet locally before continuing.
 
-### 2.13 Update CLAUDE.md
+### 2.13 GitHub Actions CI (if chosen)
+
+Run only if the user answered **Yes** to Q6.
+
+Create `.github/workflows/lint-and-typecheck.yml`:
+
+```yaml
+name: Lint, Typecheck, Test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'yarn'
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Lint
+        run: yarn lint
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: yarn test --ci
+```
+
+> Swap `yarn` → `npm ci` / `bun install --frozen-lockfile` if the project uses a different package manager. The `--frozen-lockfile` flag is the lockfile-integrity gate referenced in the team security guide §11 — it fails CI if `yarn.lock` and `package.json` disagree, blocking accidental dep drift.
+
+Create `.github/workflows/audit.yml`:
+
+```yaml
+name: Dependency Audit
+
+on:
+  pull_request:
+    paths:
+      - 'package.json'
+      - 'yarn.lock'
+  push:
+    branches: [main]
+    paths:
+      - 'package.json'
+      - 'yarn.lock'
+  schedule:
+    # Weekly on Monday at 03:00 UTC
+    - cron: '0 3 * * 1'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'yarn'
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Audit
+        run: yarn audit --level moderate
+```
+
+> **Tradeoff to flag to the user:** `yarn audit` fails the build on any moderate-or-higher advisory in the dep tree, which means transitive advisories (often unfixable on your end) can block PRs. If that becomes noisy, switch the audit job to `continue-on-error: true` and triage via GitHub issues instead — but don't silently delete it.
+
+### 2.14 Update CLAUDE.md
 
 Update CLAUDE.md to reflect:
 - Commands using the chosen package manager
