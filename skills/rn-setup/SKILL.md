@@ -36,7 +36,7 @@ Ask the user these questions in a single message. Present them as a numbered lis
 2. **None** — skip for now
 
 ### Q5. Environment Config
-1. **Yes** — set up `.env.dev/.stage/.prod` with `react-native-config`
+1. **Yes** — set up `.env.development/.stage/.production` with `react-native-config`, plus Android productFlavors and iOS scheme guide for build-time env switching
 2. **No** — skip for now
 
 ### Q6. GitHub Actions CI
@@ -247,13 +247,17 @@ Append these patterns to `.gitignore` (skip any that already exist):
 
 Install `react-native-config`.
 
-Create `.env.dev`, `.env.stage`, `.env.prod` with:
+Create `.env.development`, `.env.stage`, `.env.production` with:
 ```
 API_BASE_URL=
-APP_DISPLAY_NAME=
+WEB_BASE_URL=
 ```
 
-Create `.env.example` as committed template.
+> **What goes in each:**
+> - `API_BASE_URL` — backend API origin for each environment.
+> - `WEB_BASE_URL` — the canonical web origin (e.g. `https://yourdomain.com`). Used by the deep-link base in `/rn-core` (Q4 option 1) to strip the host before route matching, and anywhere the app needs to construct sharing URLs that mirror the website.
+
+Create `.env.example` as committed template (with empty values; this is the only env file safe to commit).
 
 Create `src/constants/env.ts`:
 ```typescript
@@ -261,11 +265,203 @@ import Config from 'react-native-config';
 
 export const ENV = {
   API_BASE_URL: Config.API_BASE_URL ?? '',
-  APP_DISPLAY_NAME: Config.APP_DISPLAY_NAME ?? '',
+  WEB_BASE_URL: Config.WEB_BASE_URL ?? '',
 };
 ```
 
 Add `.env.*` and `!.env.example` to `.gitignore`.
+
+### 2.6.1 Build flavours — multi-environment builds
+
+After the env files exist, wire up build-time environment switching so `yarn android:development` actually picks up `.env.development`, and similarly for iOS schemes.
+
+**Sub-question — bundle-ID strategy:**
+
+Ask the user before generating gradle config:
+
+```
+Bundle ID strategy across environments?
+
+  1) Separate — development/stage/production each get their own applicationId
+     (`.development`, `.stage` suffix). Lets all three coexist on the same
+     device. Best when analytics SDKs (Firebase, Mixpanel) have separate
+     dashboards per env.
+  2) Shared (default) — all three share the same applicationId; only `.env.*`
+     values differ. Best for single-workspace SDKs (WebEngage, MoEngage,
+     CleverTap) where you can't separate by bundle ID. Note: dev and prod
+     can't coexist on the same device with this option.
+  3) Hybrid — production + stage share an applicationId; development has
+     its own (`.development` suffix). Most common when staging mirrors prod
+     in analytics tooling but you still want dev isolated.
+```
+
+Default to **option 2 (Shared)** if the user just presses enter.
+
+**Android — `android/app/build.gradle`:**
+
+Apply react-native-config's `dotenv.gradle` and add the productFlavors block. Place this inside the `android { }` block, after `buildTypes`:
+
+```gradle
+project.ext.envConfigFiles = [
+  developmentDebug:   ".env.development",
+  developmentRelease: ".env.development",
+  stageDebug:         ".env.stage",
+  stageRelease:       ".env.stage",
+  productionDebug:    ".env.production",
+  productionRelease:  ".env.production",
+]
+apply from: project(':react-native-config').projectDir.getPath() + "/dotenv.gradle"
+
+android {
+  // ... existing config ...
+
+  flavorDimensions "env"
+  productFlavors {
+    development {
+      dimension "env"
+      // applicationIdSuffix depends on bundle-ID strategy — see below
+    }
+    stage {
+      dimension "env"
+    }
+    production {
+      dimension "env"
+    }
+  }
+}
+```
+
+Then apply the chosen suffix strategy:
+
+| Strategy | development | stage | production |
+|---|---|---|---|
+| 1) Separate | `applicationIdSuffix ".development"` | `applicationIdSuffix ".stage"` | (no suffix) |
+| 2) Shared (default) | (no suffix) | (no suffix) | (no suffix) |
+| 3) Hybrid | `applicationIdSuffix ".development"` | (no suffix — same as production) | (no suffix) |
+
+**iOS — manual Xcode scheme duplication** (no automation, see "Why manual" below):
+
+The skill writes step-by-step instructions and a verifier script. It does NOT modify `project.pbxproj`. Print this to the user:
+
+```
+iOS multi-env setup needs ~6 clicks in Xcode (per env scheme). One-time
+setup:
+
+  1. Open ios/<App>.xcworkspace in Xcode
+  2. Top bar: Product → Scheme → Manage Schemes…
+  3. Right-click your existing scheme (e.g. <App>) → Duplicate
+  4. Name the duplicate <App>Development
+  5. Select the new scheme, click Edit Scheme…, expand "Build" in the
+     sidebar, click "Pre-actions", "+" → "New Run Script Action"
+  6. Paste this shell into the pre-action (Knya's clean pattern):
+
+        rm "${CONFIGURATION_BUILD_DIR}/${INFOPLIST_PATH}" 2>/dev/null
+        echo ".env.development" > /tmp/envfile
+        "${SRCROOT}/../node_modules/react-native-config/ios/ReactNativeConfig/BuildXCConfig.rb" \
+          "${SRCROOT}/.." "${SRCROOT}/tmp.xcconfig"
+
+  7. In the same dialog, set "Provide build settings from" to the app
+     target (so $SRCROOT and $CONFIGURATION_BUILD_DIR resolve).
+  8. Repeat for <App>Stage (echo ".env.stage" instead).
+
+  Production keeps the original <App> scheme (no pre-action needed —
+  release builds default to .env.production via the same script when
+  ENVFILE is exported from CI, or you can add a pre-action mirroring
+  the dev one if you want it explicit).
+
+To verify: yarn run verify:ios-env
+```
+
+Create `scripts/verify-ios-env.sh` (Bash, executable):
+
+```bash
+#!/usr/bin/env bash
+# Verifies that iOS schemes are configured for multi-env builds.
+# Checks that <App>Development and <App>Stage schemes exist and that
+# their pre-actions reference react-native-config and the right .env file.
+
+set -e
+
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+IOS_DIR="$PROJECT_DIR/ios"
+
+# Find the .xcworkspace to derive app name (everything before .xcworkspace)
+WORKSPACE=$(find "$IOS_DIR" -maxdepth 2 -name "*.xcworkspace" -type d | head -1)
+if [[ -z "$WORKSPACE" ]]; then
+  echo "✗ No .xcworkspace found in $IOS_DIR"
+  exit 1
+fi
+APP_NAME=$(basename "$WORKSPACE" .xcworkspace)
+SCHEMES_DIR="$IOS_DIR/$APP_NAME.xcodeproj/xcshareddata/xcschemes"
+
+check_scheme() {
+  local scheme_name="$1"
+  local expected_env="$2"
+  local scheme_file="$SCHEMES_DIR/$scheme_name.xcscheme"
+
+  if [[ ! -f "$scheme_file" ]]; then
+    echo "✗ Missing scheme: $scheme_name (expected at $scheme_file)"
+    return 1
+  fi
+  if ! grep -q "BuildXCConfig.rb" "$scheme_file"; then
+    echo "✗ $scheme_name: pre-action does not invoke BuildXCConfig.rb"
+    return 1
+  fi
+  if ! grep -q "$expected_env" "$scheme_file"; then
+    echo "✗ $scheme_name: pre-action does not reference $expected_env"
+    return 1
+  fi
+  echo "✓ $scheme_name → $expected_env"
+}
+
+echo "Verifying iOS env schemes for $APP_NAME…"
+check_scheme "${APP_NAME}Development" ".env.development"
+check_scheme "${APP_NAME}Stage"       ".env.stage"
+echo "✓ All schemes wired"
+```
+
+Make it executable (`chmod +x scripts/verify-ios-env.sh`) and add a `verify:ios-env` script to `package.json` (covered in §2.6.2 below).
+
+> **Why manual not automated for iOS:** every approach to programmatically edit Xcode schemes / `project.pbxproj` is fragile — the file format shifts subtly across Xcode versions, and a botched edit can corrupt the workspace. All three reference projects we benchmarked (`avimee-app`, `knya-app`, `foxtale-app`) hand-duplicated schemes in Xcode UI. The 6-click cost is genuinely lower than maintaining brittle automation. The verifier compensates by catching configuration drift.
+
+### 2.6.2 Env-aware package.json scripts
+
+Determine the iOS scheme base name from the project (read it from `package.json` `name` or `app.json`). Suppose it's `<App>`. Add these 18 scripts to `package.json` (keeping any existing test/lint/prepare scripts):
+
+```jsonc
+{
+  "scripts": {
+    "start":                "react-native start",
+    "start:reset-cache":    "react-native start --reset-cache",
+
+    "android:development":  "ENVFILE=.env.development react-native run-android --variant=developmentDebug",
+    "android:stage":        "ENVFILE=.env.stage       react-native run-android --variant=stageDebug",
+    "android:production":   "ENVFILE=.env.production  react-native run-android --variant=productionDebug",
+
+    "ios:development":      "react-native run-ios --scheme '<App>Development'",
+    "ios:stage":            "react-native run-ios --scheme '<App>Stage'",
+    "ios:production":       "react-native run-ios --scheme '<App>'",
+
+    "apk:development":      "cd android && ENVFILE=.env.development ./gradlew assembleDevelopmentRelease",
+    "apk:stage":            "cd android && ENVFILE=.env.stage       ./gradlew assembleStageRelease",
+    "apk:production":       "cd android && ENVFILE=.env.production  ./gradlew assembleProductionRelease",
+
+    "aab:development":      "cd android && ENVFILE=.env.development ./gradlew bundleDevelopmentRelease",
+    "aab:stage":            "cd android && ENVFILE=.env.stage       ./gradlew bundleStageRelease",
+    "aab:production":       "cd android && ENVFILE=.env.production  ./gradlew bundleProductionRelease",
+
+    "clean:android":        "cd android && ./gradlew clean",
+    "clean:ios":            "cd ios && rm -rf build && xcodebuild -workspace <App>.xcworkspace -scheme <App> clean",
+    "clean:metro":          "watchman watch-del-all && rm -rf $TMPDIR/metro-*",
+
+    "verify:ios-env":       "bash scripts/verify-ios-env.sh"
+  }
+}
+```
+
+> Substitute `<App>` with the actual project name throughout. For the `ios:production` script, the scheme name is just `<App>` (no `Production` suffix — production keeps the default scheme; only `Development` and `Stage` are duplicates).
+
+> If the package manager is `bun` or `npm`, the scripts still work — only the CLI invocation changes (`npm run android:development` etc.).
 
 ### 2.7 Navigation (if chosen)
 

@@ -12,8 +12,8 @@ For a quick install/use reference, see the [README](../README.md). This doc is t
 
 | Skill | Purpose |
 |---|---|
-| `/rn-setup` | Bootstraps a React Native CLI project. Asks six preference questions (package manager, state, API, navigation, env, CI), then sets up folder structure, path aliases, ESLint (incl. `no-console`), Prettier, Husky, TypeScript strict, Jest, a hardened `metro.config.js` that strips `console.log/info/debug` from production bundles, `.gitignore` secrets patterns, navigation, state, API layer, env config, and (opt-in) GitHub Actions for lint + tsc + test + weekly `yarn audit`. |
-| `/rn-core` | Run after `rn-setup`. Asks three more questions (brand colors, font, encrypted storage), then installs production dependencies (Reanimated v4, FlashList, MMKV v4, FastImage, GestureHandler, KeyboardController, BottomSheet, LinearGradient, SVG) and creates a typed theme system, the `useThemeStyles` hook, base components, the root `AppWrapper`, and the state stores. If encrypted storage was selected, also installs `react-native-keychain` + `react-native-get-random-values` (and `redux-persist` if `/rn-setup` chose Redux), generates `storage.ts` with a Keychain-bootstrapped random key, wires an async storage gate into `App.tsx`, and (for Redux) wraps the auth slice in `persistReducer` with a whitelist. |
+| `/rn-setup` | Bootstraps a React Native CLI project. Asks six preference questions (package manager, state, API, navigation, env, CI), then sets up folder structure, path aliases, ESLint (incl. `no-console`), Prettier, Husky, TypeScript strict, Jest, a hardened `metro.config.js` that strips `console.log/info/debug` from production bundles, `.gitignore` secrets patterns, navigation, state, API layer, env config, and (opt-in) GitHub Actions for lint + tsc + test + weekly `yarn audit`. When env config is enabled, also wires Android `productFlavors` (development/stage/production) with a chosen bundle-ID strategy, a guided iOS scheme setup using `react-native-config`'s `BuildXCConfig.rb` pre-action pattern, a verifier script for iOS, and 18 env-aware npm scripts covering run / APK / AAB / clean across all three environments. |
+| `/rn-core` | Run after `rn-setup`. Asks four more questions (brand colors, font, encrypted storage, optional utilities), then installs production dependencies (Reanimated v4, FlashList, MMKV v4, FastImage, GestureHandler, KeyboardController, BottomSheet, LinearGradient, SVG) and creates a typed theme system, the `useThemeStyles` hook, base components, the root `AppWrapper`, and the state stores. If encrypted storage was selected, also installs `react-native-keychain` + `react-native-get-random-values` (and `redux-persist` if `/rn-setup` chose Redux), generates `storage.ts` with a Keychain-bootstrapped random key, wires an async storage gate into `App.tsx`, and (for Redux) wraps the auth slice in `persistReducer` with a whitelist. The Q4 multi-select adds any subset of: a deep-linking skeleton (extractor + dynamic route resolver + `useDeepLink` cold/warm-start hook + `navigationRef` wiring), an error handler abstraction (dev-only console, prod-stub for future Sentry adoption), a Zustand-backed toast manager + Reanimated component, a `react-native-permissions`-backed location helper, and a `@react-native-community/netinfo`-backed network status hook + slim offline banner. |
 | `/rn-security` | Run after `rn-core`. Generates the Android `network_security_config.xml` for release builds (TLS-only, system CAs only) plus a debug variant that allows cleartext only to Metro's localhost endpoints, and wires `android:networkSecurityConfig` into `AndroidManifest.xml`. Idempotent — re-running detects prior installation and skips. iOS App Transport Security is already on by default; no changes there. |
 
 The skills are generic — no project-specific code. Brand colors, fonts, API layer, package manager, encryption, CI are all asked at scaffold time.
@@ -58,7 +58,10 @@ Plus:
 - `jest.config.js` with `moduleNameMapper` for `@/*` and `passWithNoTests: true`
 - `.husky/pre-commit` running `lint-staged` (eslint + prettier on staged files)
 - `App.tsx` wired with the chosen providers in the correct order
-- `.env.dev/.stage/.prod` + `.env.example` if env config chosen
+- `.env.development/.stage/.production` + `.env.example` if env config chosen (each carries `API_BASE_URL` and `WEB_BASE_URL`)
+- Android `productFlavors { development; stage; production }` in `android/app/build.gradle` with `dotenv.gradle` + `envConfigFiles` mapping (env config only)
+- iOS multi-env: `scripts/verify-ios-env.sh` + a one-time manual Xcode scheme setup guide using `react-native-config`'s `BuildXCConfig.rb` pre-action pattern (env config only — schemes are duplicated by the user in Xcode UI, not the plugin)
+- 18 env-aware npm scripts (`yarn android:development`, `yarn ios:production`, `yarn apk:stage`, `yarn aab:development`, `yarn clean:metro`, etc.) when env config is on; baseline `yarn start`, `yarn start:reset-cache` always
 - `.github/workflows/lint-and-typecheck.yml` + `audit.yml` (if Q6 = Yes)
 
 > **Why no Zustand `storage.ts` / `authStore.ts` here:** they're written by `/rn-core` so the encryption choice (Q3 in `/rn-core`) can govern what the templates look like. Keeping the templates in one skill avoids two skills racing on the same files.
@@ -91,6 +94,14 @@ src/
 Plus, if Q3 = Yes:
 - `index.js` updated to import `react-native-get-random-values` as the very first statement
 - `App.tsx` updated to await `bootstrapStorage()` before rendering (and wrap Redux children in `<PersistGate>`)
+
+Plus, if Q4 picked any of these (each independent):
+
+- **Option 1 (Deep-link)**: `src/utils/deepLink/{extractPath, extractParams}.ts`, `src/navigation/{navigationRef, routesConfig, resolveRoute, navigateByPath}.ts`, `src/hooks/useDeepLink.ts`. `routesConfig.ts` ships empty (with a commented example) — you fill in the route patterns; everything else is generic infrastructure. Dynamic-only matcher: patterns with `:slug` extract path params; literal segments must match. `extractPath` strips `Config.WEB_BASE_URL` automatically, so no host config is needed once `.env.*` is filled in.
+- **Option 2 (Error handler)**: `src/utils/errorHandler.ts` — dev console / prod stub. No external deps; swap the stub for Sentry/Crashlytics later without changing call sites.
+- **Option 3 (Toast)**: `src/store/toastStore.ts` + `src/components/core/Toast.tsx` (Reanimated-based, dual position). Mounted in `AppWrapper`.
+- **Option 4 (Location)**: installs `react-native-permissions`. `src/hooks/useLocationPermission.ts`. Reminders printed about adding the iOS `Info.plist` keys + Android manifest permission.
+- **Option 5 (Network)**: installs `@react-native-community/netinfo`. `src/hooks/useNetworkStatus.ts` + `src/components/core/NetworkStatusBanner.tsx`. Banner mounted in `AppWrapper`; hook also exported.
 
 `App.tsx` is updated to mount `<KeyboardProvider>` and `<AppWrapper>` around the navigator. The example `HomeScreen` is rewritten to demonstrate the recommended theme pattern.
 
@@ -141,11 +152,12 @@ Then:
 /rn-core
 ```
 
-Answers three more questions:
+Answers four more questions:
 
 1. Brand colors — hex codes or `skip`.
 2. Font family — name or `skip`.
 3. Encrypted local storage — Yes (recommended) or No. Yes uses a Keychain-stored random key to encrypt MMKV; No leaves storage in plaintext (prototype mode only).
+4. Optional utilities — multi-select like `1,3,5` or `none`. Pick any subset of: deep-linking base / error handler / toast manager / location permission / network status + offline banner.
 
 If you provided a font name, drop the corresponding `.ttf` files into `src/assets/fonts/` and run `npx react-native-asset` to link them.
 
@@ -202,6 +214,17 @@ Please follow these — they're enforced by ESLint where possible, and code revi
 - **Every scaffold run must end with `lint --fix` + `tsc --noEmit` + `yarn test` all exiting 0.** The skills run these automatically; treat any failure as a blocker.
 
 ---
+
+## Roadmap — deferred skills
+
+These four are tracked for future development; none are implemented in v0.1.5.
+
+| Skill | Scope |
+|---|---|
+| `/rn-firebase` | Firebase Analytics + Crashlytics + Performance + Remote Config + Sentry, bundled as one adoption. Adds reportToProvider wiring into the `errorHandler.ts` stub generated by `/rn-core` Q4. |
+| `/rn-update-ota` | Force-update gate driven by Remote Config (min/latest version + maintenance flag), four variants (maintenance, force, dismissible stable, OTA-triggered), `compareVersions` semver utility, `AppUpdateBottomSheet` UI. OTA provider to be picked at skill build-time (CodePush was deprecated by Microsoft in 2025; RevoPush is the paid community fork; Expo OTA requires Expo). |
+| `/rn-push` | FCM permission (iOS auth-status + Android 13+ POST_NOTIFICATIONS), token fetch + refresh, foreground/background/cold-start listeners, push-payload deep-link routing (hooks into `navigateByPath` from `/rn-core` Q4), and a vendor adapter — user picks WebEngage / MoEngage / CleverTap and the skill scaffolds that integration with a shared `EngagementProvider` interface so the same hook code works regardless of vendor. |
+| `/rn-ci-cd` | Fastlane lanes (`beta`, `release`), GitHub Actions release workflow with environment dispatch, keystore-from-base64 secret pattern, AAB upload to Play Console, source-map upload to Sentry / Crashlytics. Separate from the basic lint+tsc+test workflows generated by `/rn-setup` Q6. |
 
 ## Upstream versions targeted
 
@@ -264,6 +287,21 @@ You probably have a manual `<network-security-config>` block already in `Android
 
 **`yarn audit` is failing CI on a transitive advisory I can't fix.**
 That's the documented tradeoff (see `/rn-setup` Step 2.13). Switch the audit job to `continue-on-error: true` and triage advisories via GitHub issues weekly. Don't silently delete the job.
+
+**`yarn ios:development` builds but env vars come back undefined.**
+The Xcode scheme pre-action didn't run. Most common cause: you duplicated the scheme but didn't paste the `BuildXCConfig.rb` shell into Build → Pre-actions. Run `yarn verify:ios-env` — the script reports which scheme is missing the pre-action.
+
+**`yarn android:stage` fails with `Variant 'stageDebug' does not exist`.**
+The `productFlavors` block isn't in `android/app/build.gradle` (or the `dimension "env"` line is missing). Open the gradle file and confirm the flavours block matches `/rn-setup` §2.6.1. After editing, run `cd android && ./gradlew clean && cd ..` before re-running.
+
+**Bundle-ID strategy hindsight — I picked Shared but now want Separate.**
+Open `android/app/build.gradle` and add `applicationIdSuffix ".development"` / `".stage"` to the matching flavour. After changing, the dev install becomes a *different app* on the device — you'll need to uninstall the old one. iOS schemes already use `.env.*` for the bridging header, so no iOS change is needed.
+
+**Deep-link skeleton is in place but tapping a link does nothing.**
+Three things to check, in order: (1) `Config.WEB_BASE_URL` is set in the `.env.*` you're running — verify with `console.log(Config.WEB_BASE_URL)` (DEV only) somewhere on first render. (2) Your route is added to `src/navigation/routesConfig.ts` and the pattern matches — `/products/:handle` matches `https://yourdomain.com/products/aloe`, not `https://yourdomain.com/product/aloe` (singular). (3) Custom-scheme URLs (`myapp://…`) require an `<intent-filter>` in `AndroidManifest.xml` and `CFBundleURLTypes` in `Info.plist` — neither is added by the skill, so add them manually when you pick a scheme.
+
+**Network banner shows even though I have internet.**
+`isConnected` is `true` on captive-portal Wi-Fi (you're physically connected, but can't reach the internet). The banner ships keyed off `isConnected`. For real-reachability gating use `isInternetReachable` from the same `useNetworkStatus()` hook — it runs a reachability probe.
 
 **Anything else.**
 File an issue at github.com/JasoliyaShruti/rn-scaffold-plugin with the exact error, your plugin version, and your Claude Code version (`claude --version`).

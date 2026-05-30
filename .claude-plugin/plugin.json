@@ -1,6 +1,6 @@
 {
   "name": "rn-scaffold",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Production-ready React Native CLI scaffold + core deps + security baseline",
   "author": { "name": "Shruti Jasoliya" },
   "homepage": "https://github.com/JasoliyaShruti/rn-scaffold-plugin",

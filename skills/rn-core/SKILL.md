@@ -14,7 +14,7 @@ Install production dependencies and create the theme system, core hooks, core co
 
 ## Step 0 — Ask Preferences
 
-Ask the user these three questions before any installs. They control the theme, typography, and storage encryption. Present them in a single message:
+Ask the user these four questions before any installs. They control the theme, typography, storage encryption, and optional utilities. Present them in a single message:
 
 ### Q1. Brand Colors
 "Do you have brand colors for this project? Provide hex codes (e.g. `primary: #FF6B00, secondary: #1B1B1B`) or reply `skip` to use a neutral black/white default palette."
@@ -39,7 +39,25 @@ Ask the user these three questions before any installs. They control the theme, 
   - **Doesn't protect from compromised devices** — a rooted/jailbroken device with the app's process can still read the decrypted in-memory copy. This is at-rest protection only, valuable for stolen-device and offline-backup scenarios.
 - Skip applies if the user picked `None` for state management in `/rn-setup` — there's nothing to encrypt yet.
 
-Wait for all three answers before proceeding.
+### Q4. Optional utilities (multi-select)
+
+"Which optional utilities to include? Reply with the numbers you want — e.g. `1,3,5` or `none`:
+
+  1) **Deep-linking base** — generic skeleton for handling deep links: URL extractor, dynamic-pattern route resolver, `navigateByPath`, `useDeepLink` hook with cold/warm-start handling, `NavigationContainer.onReady` wiring. Strips host using `Config.WEB_BASE_URL` from your `.env` files. **You fill in the actual routes; the skeleton handles arrival + matching + navigation.** Native manifest config (custom URL scheme, universal links) is NOT included — add later when you have a scheme + verified domain.
+
+  2) **Error handler** — `src/utils/errorHandler.ts` with `__DEV__`-aware console behaviour (verbose in dev, silenced in prod). No external deps. Designed to be swappable later for Sentry/Crashlytics when you add `/rn-firebase`.
+
+  3) **Toast manager** — `src/store/toastStore.ts` + `src/components/core/Toast.tsx`. Zustand-backed, dual position (top/bottom), auto-dismiss with cleanup, Reanimated-based show/hide. Mounted by `AppWrapper` so it's available everywhere.
+
+  4) **Location permission helper** — `src/hooks/useLocationPermission.ts` with `check()` + `request()` + Android GPS-enable prompt. Installs `react-native-permissions` (needs `pod install`).
+
+  5) **Network status** — `src/hooks/useNetworkStatus.ts` + `src/components/core/NetworkStatusBanner.tsx` (slim non-blocking banner at top of screen when offline, auto-hides on reconnect). Installs `@react-native-community/netinfo`. Banner wired into `AppWrapper`; hook also exported for screen-level use."
+
+- Default if user replies empty: **`none`**.
+- Each item is independent — pick any subset.
+- Files for un-selected items are NOT generated and their deps are NOT installed.
+
+Wait for all four answers before proceeding.
 
 ---
 
@@ -381,7 +399,7 @@ export type { NamedStyles } from './styleTypes';
 
 ---
 
-## Step 4 — Stores (Storage + Auth + Theme)
+## Step 4 — Stores + Optional Utilities
 
 This step writes the store files that `/rn-setup` deliberately deferred. Three sub-steps:
 
@@ -673,6 +691,694 @@ Appearance.addChangeListener(({ colorScheme }) => {
 Update `src/store/index.ts` barrel to export `themeStore` alongside `authStore` and `storage`.
 
 > Default is `'system'` so the app respects OS dark mode automatically. Users can override via `setMode('light')` / `setMode('dark')`.
+
+---
+
+### 4.4 Optional utilities (conditional on Q4)
+
+Generate only the items the user selected in Q4. Skip everything else entirely (no files, no installs).
+
+---
+
+#### 4.4 — Option 1: Deep-linking base
+
+Generic skeleton — handles arrival, parsing, dynamic-pattern matching, and `navigationRef`-based navigation. The user fills in their actual routes; the infrastructure is reusable.
+
+**No new deps** (uses RN's built-in `Linking` API + the existing `@react-navigation/native` install).
+
+Create `src/utils/deepLink/extractPath.ts`:
+
+```typescript
+import Config from 'react-native-config';
+
+/**
+ * Strip scheme + host from a URL to leave a clean path.
+ *
+ * Reads `WEB_BASE_URL` from your .env.* files (e.g. https://yourdomain.com)
+ * and strips that host plus any custom scheme. Also strips the query string
+ * and URL fragment so the result is matchable.
+ *
+ *   extractPath('https://yourdomain.com/products/aloe?ref=ig#review')
+ *     -> '/products/aloe'
+ *   extractPath('myapp://products/aloe')
+ *     -> '/products/aloe'
+ */
+export const extractPath = (url: string): string => {
+  if (!url) return '/';
+  let path = url;
+
+  // Strip web host from WEB_BASE_URL (handles http(s)://… variants)
+  const webBase = (Config.WEB_BASE_URL ?? '').replace(/\/$/, '');
+  if (webBase) {
+    const hostOnly = webBase.replace(/^https?:\/\//, '');
+    path = path.replace(new RegExp(`^https?://${hostOnly}`, 'i'), '');
+  }
+
+  // Strip any leftover scheme (custom scheme like myapp://, or unmatched http(s)://)
+  path = path.replace(/^[a-z][a-z0-9+\-.]*:\/\/[^/]*/i, '');
+
+  // Strip query string and fragment
+  path = path.split('?')[0].split('#')[0];
+
+  return path.startsWith('/') ? path : `/${path}`;
+};
+```
+
+Create `src/utils/deepLink/extractParams.ts`:
+
+```typescript
+/** Parse a URL's query string into a plain object. Returns `{}` if no query. */
+export const extractParams = (url: string): Record<string, string> => {
+  const queryStart = url.indexOf('?');
+  if (queryStart === -1) return {};
+
+  const queryString = url.slice(queryStart + 1).split('#')[0];
+  const params: Record<string, string> = {};
+
+  for (const pair of queryString.split('&')) {
+    if (!pair) continue;
+    const [k, v = ''] = pair.split('=');
+    params[decodeURIComponent(k)] = decodeURIComponent(v);
+  }
+  return params;
+};
+```
+
+Create `src/utils/deepLink/index.ts`:
+
+```typescript
+export { extractPath } from './extractPath';
+export { extractParams } from './extractParams';
+```
+
+Create `src/navigation/navigationRef.ts`:
+
+```typescript
+import { createNavigationContainerRef } from '@react-navigation/native';
+
+export const navigationRef = createNavigationContainerRef();
+```
+
+Create `src/navigation/routesConfig.ts` — **the user fills this in**:
+
+```typescript
+/**
+ * Route definition for the deep-link router.
+ *
+ * Dynamic-only: every path is a pattern. Static paths just have no `:params`.
+ *   { pattern: '/men',                screenName: 'Home' }
+ *   { pattern: '/products/:handle',   screenName: 'ProductDetail' }
+ *   { pattern: '/orders/:id/items',   screenName: 'OrderItems' }
+ *
+ * Add entries as your app grows. Order matters: the first match wins.
+ */
+export type RouteDef = {
+  pattern: string;
+  screenName: string;
+};
+
+export const ROUTES_CONFIG: RouteDef[] = [
+  // Example — uncomment and adapt:
+  // { pattern: '/home',               screenName: 'Home' },
+  // { pattern: '/products/:handle',   screenName: 'ProductDetail' },
+];
+```
+
+Create `src/navigation/resolveRoute.ts`:
+
+```typescript
+import { RouteDef } from './routesConfig';
+
+export interface ResolvedRoute {
+  screenName: string;
+  params: Record<string, string>;
+}
+
+/**
+ * Match a path against the route table.
+ *
+ *   resolveRoute('/products/aloe', [{ pattern: '/products/:handle', screenName: 'PDP' }])
+ *     -> { screenName: 'PDP', params: { handle: 'aloe' } }
+ *
+ * Returns null if nothing matches.
+ */
+export const resolveRoute = (
+  path: string,
+  routes: RouteDef[],
+): ResolvedRoute | null => {
+  const pathSegments = path.split('/').filter(Boolean);
+
+  for (const route of routes) {
+    const patternSegments = route.pattern.split('/').filter(Boolean);
+    if (patternSegments.length !== pathSegments.length) continue;
+
+    const params: Record<string, string> = {};
+    let matched = true;
+
+    for (let i = 0; i < patternSegments.length; i++) {
+      const p = patternSegments[i];
+      if (p.startsWith(':')) {
+        params[p.slice(1)] = pathSegments[i];
+      } else if (p !== pathSegments[i]) {
+        matched = false;
+        break;
+      }
+    }
+
+    if (matched) return { screenName: route.screenName, params };
+  }
+
+  return null;
+};
+```
+
+Create `src/navigation/navigateByPath.ts`:
+
+```typescript
+import { Linking } from 'react-native';
+
+import { extractParams, extractPath } from '@/utils/deepLink';
+
+import { navigationRef } from './navigationRef';
+import { resolveRoute } from './resolveRoute';
+import { ROUTES_CONFIG } from './routesConfig';
+
+/**
+ * Route a URL into the navigation stack.
+ *
+ * - Resolves the URL against ROUTES_CONFIG.
+ * - Merges path params (from `:slug` matchers) with query-string params.
+ * - Falls back to opening the URL in an external browser if nothing matches.
+ *
+ * Returns true if a route was matched + navigated, false otherwise.
+ *
+ * If your project uses nested navigators (e.g. Drawer → Tabs → Screen), edit
+ * the navigationRef.navigate(...) call below to your nested shape, e.g.:
+ *
+ *   navigationRef.navigate('Drawer', {
+ *     screen: 'Tabs',
+ *     params: { screen: resolved.screenName, params },
+ *   });
+ */
+export const navigateByPath = (url: string): boolean => {
+  if (!url) return false;
+
+  const path = extractPath(url);
+  const queryParams = extractParams(url);
+  const resolved = resolveRoute(path, ROUTES_CONFIG);
+
+  if (!resolved) {
+    if (__DEV__) {
+      // eslint-disable-next-line no-console
+      console.warn(`[deepLink] no route matched for "${path}" (from "${url}")`);
+    }
+    // Optional: open unknown links in browser. Comment out if you prefer silent no-op.
+    Linking.canOpenURL(url).then(can => {
+      if (can) Linking.openURL(url);
+    });
+    return false;
+  }
+
+  const params = { ...resolved.params, ...queryParams };
+  navigationRef.navigate(resolved.screenName as never, params as never);
+  return true;
+};
+```
+
+Create `src/hooks/useDeepLink.ts`:
+
+```typescript
+import { useCallback, useEffect, useRef } from 'react';
+import { Linking } from 'react-native';
+
+import { navigateByPath } from '@/navigation/navigateByPath';
+import { navigationRef } from '@/navigation/navigationRef';
+
+/**
+ * Wires deep-link arrival into the navigation stack.
+ *
+ * - Cold start: `Linking.getInitialURL()` reads whatever URL launched the app.
+ * - Warm start: `Linking.addEventListener('url', …)` catches URLs received
+ *   while the app is running.
+ * - Race guard: if the navigation stack isn't ready when a URL arrives
+ *   (typical for cold start), the URL is queued in `pendingUrlRef` and
+ *   flushed by `onNavigationReady` — which the caller wires into
+ *   `<NavigationContainer onReady={…} />`.
+ *
+ * Usage:
+ *   const { onNavigationReady } = useDeepLink();
+ *   <NavigationContainer ref={navigationRef} onReady={onNavigationReady}>…
+ */
+export const useDeepLink = () => {
+  const pendingUrlRef = useRef<string | null>(null);
+
+  const handleUrl = useCallback((url: string) => {
+    if (!navigationRef.isReady()) {
+      pendingUrlRef.current = url;
+      return;
+    }
+    navigateByPath(url);
+  }, []);
+
+  const onNavigationReady = useCallback(() => {
+    const pending = pendingUrlRef.current;
+    if (!pending) return;
+    pendingUrlRef.current = null;
+    navigateByPath(pending);
+  }, []);
+
+  useEffect(() => {
+    Linking.getInitialURL().then(url => {
+      if (url) handleUrl(url);
+    });
+    const subscription = Linking.addEventListener('url', ({ url }) => handleUrl(url));
+    return () => subscription.remove();
+  }, [handleUrl]);
+
+  return { onNavigationReady };
+};
+```
+
+**Update `src/navigation/RootNavigator.tsx`** (or wherever `NavigationContainer` is mounted) — wire up the hook:
+
+```typescript
+import { NavigationContainer } from '@react-navigation/native';
+
+import { useDeepLink } from '@/hooks/useDeepLink';
+import { navigationRef } from '@/navigation/navigationRef';
+
+export const RootNavigator = () => {
+  const { onNavigationReady } = useDeepLink();
+
+  return (
+    <NavigationContainer ref={navigationRef} onReady={onNavigationReady}>
+      {/* existing stack navigator */}
+    </NavigationContainer>
+  );
+};
+```
+
+> **What's intentionally NOT included:**
+> - **Native manifest config** (`AndroidManifest.xml` intent filter, `Info.plist` `CFBundleURLTypes`) — these need a chosen URL scheme (e.g. `myapp://`) or a verified Universal Links domain, which most projects don't have at scaffold time. Add them when ready.
+> - **Push-payload routing** — push notifications carry deep links too, but FCM setup goes in the future `/rn-push` skill which will hook into this same `navigateByPath`.
+> - **Nested-navigator hardcoding** — `navigateByPath.ts` ships with a flat `navigationRef.navigate(screenName, params)` call. Projects with Drawer/Tabs edit the comment-block snippet inside that file (one-line change). Keeping it un-opinionated prevents wrong defaults.
+
+Update barrels: `src/utils/index.ts` (add `./deepLink`), `src/navigation/index.ts` (add `navigationRef`, `navigateByPath`, `RouteDef`, `ROUTES_CONFIG`), `src/hooks/index.ts` (add `useDeepLink`).
+
+---
+
+#### 4.4 — Option 2: Error handler
+
+Create `src/utils/errorHandler.ts`:
+
+```typescript
+/**
+ * Lightweight error/event reporter with a dev-vs-prod split.
+ *
+ * In `__DEV__`: logs to the console (preserving stack + context for inspection).
+ * In production: silenced by default — wire up Sentry / Crashlytics / your
+ * provider of choice in the `reportToProvider` stub below.
+ *
+ * The shape is designed to swap cleanly for `@sentry/react-native` later
+ * (Sentry's `captureException(error, { extra })` accepts the same context
+ * object), so the call sites you write today don't change when you adopt
+ * `/rn-firebase` or any other observability skill.
+ */
+export type ErrorContext = Record<string, unknown>;
+
+const reportToProvider = (_error: unknown, _context?: ErrorContext): void => {
+  // Replace this body once a provider is configured. Example:
+  //   Sentry.captureException(_error, { extra: _context });
+  //   crashlytics().recordError(_error as Error);
+};
+
+export const errorHandler = (error: unknown, context?: ErrorContext): void => {
+  if (__DEV__) {
+    // eslint-disable-next-line no-console
+    console.error('[errorHandler]', error, context ?? {});
+    return;
+  }
+  reportToProvider(error, context);
+};
+
+export const logEvent = (message: string, context?: ErrorContext): void => {
+  if (__DEV__) {
+    // eslint-disable-next-line no-console
+    console.log('[logEvent]', message, context ?? {});
+    return;
+  }
+  // Hook into your analytics here later, e.g. analytics().logEvent(message, context).
+};
+```
+
+> **Why no Sentry install:** observability is a separate concern. When you adopt `/rn-firebase` (deferred skill), the `reportToProvider` stub becomes a 2-line edit instead of a refactor across the codebase.
+
+Update `src/utils/index.ts` barrel.
+
+---
+
+#### 4.4 — Option 3: Toast manager (store + component)
+
+Two files, always paired.
+
+Install: `react-native-reanimated` is already installed by `/rn-core` Step 1. No new deps.
+
+Create `src/store/toastStore.ts`:
+
+```typescript
+import { create } from 'zustand';
+
+export type ToastPosition = 'top' | 'bottom';
+export type ToastVariant = 'success' | 'error' | 'info';
+
+interface ToastState {
+  message: string | null;
+  position: ToastPosition;
+  variant: ToastVariant;
+  visible: boolean;
+  show: (
+    message: string,
+    options?: { position?: ToastPosition; variant?: ToastVariant; durationMs?: number },
+  ) => void;
+  hide: () => void;
+}
+
+let hideTimer: ReturnType<typeof setTimeout> | null = null;
+
+export const useToastStore = create<ToastState>(set => ({
+  message: null,
+  position: 'bottom',
+  variant: 'info',
+  visible: false,
+
+  show: (message, options) => {
+    if (hideTimer) {
+      clearTimeout(hideTimer);
+      hideTimer = null;
+    }
+    set({
+      message,
+      position: options?.position ?? 'bottom',
+      variant: options?.variant ?? 'info',
+      visible: true,
+    });
+    hideTimer = setTimeout(() => {
+      set({ visible: false });
+      hideTimer = null;
+    }, options?.durationMs ?? 3000);
+  },
+
+  hide: () => {
+    if (hideTimer) {
+      clearTimeout(hideTimer);
+      hideTimer = null;
+    }
+    set({ visible: false });
+  },
+}));
+```
+
+> **Why `zustand` and not Context:** toasts fire from anywhere (utility functions, error handlers, side effects) — `useToastStore.getState().show(…)` works outside React without needing a hook. Context would force every call site to either be a component or pass the dispatcher around.
+
+Create `src/components/core/Toast.tsx`:
+
+```typescript
+import { useEffect } from 'react';
+import { StyleSheet, Text } from 'react-native';
+
+import Animated, {
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from 'react-native-reanimated';
+
+import { useThemeStyles } from '@/hooks';
+import { spacing, typography } from '@/theme';
+import { useToastStore } from '@/store/toastStore';
+
+export const Toast = () => {
+  const { message, position, variant, visible } = useToastStore();
+  const styles = useToastStyles(variant);
+  const opacity = useSharedValue(0);
+  const translateY = useSharedValue(20);
+
+  useEffect(() => {
+    opacity.value = withTiming(visible ? 1 : 0, { duration: 220 });
+    translateY.value = withTiming(visible ? 0 : 20, { duration: 220 });
+  }, [visible, opacity, translateY]);
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    opacity: opacity.value,
+    transform: [{ translateY: position === 'top' ? -translateY.value : translateY.value }],
+  }));
+
+  if (!message) return null;
+
+  return (
+    <Animated.View
+      pointerEvents="none"
+      style={[
+        styles.container,
+        position === 'top' ? styles.top : styles.bottom,
+        animatedStyle,
+      ]}
+    >
+      <Text style={styles.message}>{message}</Text>
+    </Animated.View>
+  );
+};
+
+const useToastStyles = (variant: 'success' | 'error' | 'info') =>
+  useThemeStyles(
+    ({ colors }) => ({
+      container: {
+        position: 'absolute',
+        left: spacing.lg,
+        right: spacing.lg,
+        paddingVertical: spacing.md,
+        paddingHorizontal: spacing.lg,
+        borderRadius: 8,
+        backgroundColor:
+          variant === 'error'
+            ? colors.error
+            : variant === 'success'
+              ? colors.success
+              : colors.backgroundInverse,
+      },
+      top:    { top: spacing.xxl },
+      bottom: { bottom: spacing.xxl },
+      message: { ...typography.bodySmall, color: colors.textInverse, textAlign: 'center' },
+    }),
+    [variant],
+  );
+```
+
+**Mount the Toast in `AppWrapper`** (Step 7). Inside the `BottomSheetModalProvider`, add `<Toast />` as a sibling of `{children}` so it renders above all screens:
+
+```typescript
+<BottomSheetModalProvider>
+  {children}
+  <Toast />
+</BottomSheetModalProvider>
+```
+
+Update barrels: `src/store/index.ts` (export `useToastStore`), `src/components/core/index.ts` (export `Toast`).
+
+---
+
+#### 4.4 — Option 4: Location permission helper
+
+Install: `react-native-permissions`. Runs `pod install` after.
+
+```bash
+yarn add react-native-permissions
+cd ios && pod install && cd ..
+```
+
+> **iOS Info.plist note:** the user must add `NSLocationWhenInUseUsageDescription` (and `NSLocationAlwaysAndWhenInUseUsageDescription` if they want background) to `ios/<App>/Info.plist` with a human-readable reason string. iOS rejects the build at runtime without it. The skill prints this reminder; it doesn't modify Info.plist.
+
+> **Android Manifest note:** the user must add `<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />` (or `ACCESS_COARSE_LOCATION`) to `android/app/src/main/AndroidManifest.xml`. The skill prints this reminder.
+
+Create `src/hooks/useLocationPermission.ts`:
+
+```typescript
+import { useCallback } from 'react';
+import { Platform } from 'react-native';
+
+import {
+  check,
+  PERMISSIONS,
+  request,
+  RESULTS,
+  type PermissionStatus,
+} from 'react-native-permissions';
+
+const LOCATION_PERMISSION = Platform.select({
+  ios: PERMISSIONS.IOS.LOCATION_WHEN_IN_USE,
+  android: PERMISSIONS.ANDROID.ACCESS_FINE_LOCATION,
+});
+
+export type LocationPermissionResult = {
+  status: PermissionStatus;
+  granted: boolean;
+};
+
+export const useLocationPermission = () => {
+  const checkPermission = useCallback(async (): Promise<LocationPermissionResult> => {
+    if (!LOCATION_PERMISSION) {
+      return { status: RESULTS.UNAVAILABLE, granted: false };
+    }
+    const status = await check(LOCATION_PERMISSION);
+    return { status, granted: status === RESULTS.GRANTED };
+  }, []);
+
+  const requestPermission = useCallback(async (): Promise<LocationPermissionResult> => {
+    if (!LOCATION_PERMISSION) {
+      return { status: RESULTS.UNAVAILABLE, granted: false };
+    }
+    const status = await request(LOCATION_PERMISSION);
+    return { status, granted: status === RESULTS.GRANTED };
+  }, []);
+
+  return { checkPermission, requestPermission };
+};
+```
+
+> **Why no Android-GPS-enable prompt baked in:** `react-native-permissions` v4 dropped the `promptForEnableLocationIfNeeded` helper. The Knya/Foxtale projects we benchmarked still used it via `react-native-android-location-enabler` (separate dep). Don't install that here — most apps don't need it (the permission flow already takes the user to settings on Android). Add it later if a screen explicitly needs the GPS-on dialog.
+
+Update `src/hooks/index.ts` barrel.
+
+---
+
+#### 4.4 — Option 5: Network status (hook + banner — Variant 2)
+
+Install: `@react-native-community/netinfo`. Run `pod install`.
+
+```bash
+yarn add @react-native-community/netinfo
+cd ios && pod install && cd ..
+```
+
+Create `src/hooks/useNetworkStatus.ts`:
+
+```typescript
+import { useEffect, useState } from 'react';
+import NetInfo, { NetInfoState } from '@react-native-community/netinfo';
+
+export type NetworkStatus = {
+  isConnected: boolean;
+  isInternetReachable: boolean | null;
+  type: NetInfoState['type'];
+};
+
+export const useNetworkStatus = (): NetworkStatus => {
+  const [state, setState] = useState<NetworkStatus>({
+    isConnected: true,
+    isInternetReachable: null,
+    type: 'unknown',
+  });
+
+  useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener(s => {
+      setState({
+        isConnected: !!s.isConnected,
+        isInternetReachable: s.isInternetReachable,
+        type: s.type,
+      });
+    });
+    NetInfo.fetch().then(s => {
+      setState({
+        isConnected: !!s.isConnected,
+        isInternetReachable: s.isInternetReachable,
+        type: s.type,
+      });
+    });
+    return () => unsubscribe();
+  }, []);
+
+  return state;
+};
+```
+
+> **Why `isConnected` AND `isInternetReachable`:** `isConnected` is true on captive-portal Wi-Fi and other "physically connected but no internet" cases. `isInternetReachable` runs an actual reachability probe. The banner below uses `isConnected === false` (the more conservative signal); a screen that needs to actually hit the network should check `isInternetReachable === false`.
+
+Create `src/components/core/NetworkStatusBanner.tsx`:
+
+```typescript
+import { useEffect } from 'react';
+import { StyleSheet, Text } from 'react-native';
+
+import Animated, {
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from 'react-native-reanimated';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+import { useThemeStyles } from '@/hooks';
+import { useNetworkStatus } from '@/hooks/useNetworkStatus';
+import { spacing, typography } from '@/theme';
+
+/**
+ * Slim non-blocking banner at the top of the screen, visible only when offline.
+ * Auto-hides on reconnect. Sits above safe-area inset.
+ */
+export const NetworkStatusBanner = () => {
+  const { isConnected } = useNetworkStatus();
+  const insets = useSafeAreaInsets();
+  const styles = useBannerStyles();
+  const translateY = useSharedValue(-100);
+
+  useEffect(() => {
+    translateY.value = withTiming(isConnected ? -100 : 0, { duration: 220 });
+  }, [isConnected, translateY]);
+
+  const animatedStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: translateY.value }],
+  }));
+
+  return (
+    <Animated.View
+      pointerEvents="none"
+      style={[styles.banner, { paddingTop: insets.top + spacing.xs }, animatedStyle]}
+    >
+      <Text style={styles.text}>No internet — some features may not work</Text>
+    </Animated.View>
+  );
+};
+
+const useBannerStyles = () =>
+  useThemeStyles(({ colors }) => ({
+    banner: {
+      position: 'absolute',
+      top: 0,
+      left: 0,
+      right: 0,
+      paddingHorizontal: spacing.lg,
+      paddingBottom: spacing.sm,
+      backgroundColor: colors.error,
+      zIndex: 1000,
+    },
+    text: {
+      ...typography.bodySmall,
+      color: colors.textInverse,
+      textAlign: 'center',
+    },
+  }));
+```
+
+**Mount the banner in `AppWrapper`** (Step 7). Right after `SafeAreaProvider` opens so the banner can read insets:
+
+```typescript
+<SafeAreaProvider>
+  <NetworkStatusBanner />
+  <BottomSheetModalProvider>{children}</BottomSheetModalProvider>
+</SafeAreaProvider>
+```
+
+Update barrels: `src/hooks/index.ts` (`useNetworkStatus`), `src/components/core/index.ts` (`NetworkStatusBanner`).
+
+> **Hook is exported for screen-level use too.** High-stakes screens (checkout, payment) can do `const { isInternetReachable } = useNetworkStatus(); if (isInternetReachable === false) return <FullPageOffline />` and render their own blocking UI on top of the global banner.
 
 ---
 
